@@ -569,8 +569,8 @@ def analyze_search(search_id: int, data: AnalyzeIn, user_id: int = Depends(get_c
             },
             timeout=90,
         )
-    except Exception:
-        raise HTTPException(502, "تعذر الاتصال بخدمة التحليل — أعد الضغط على الزر للاستئناف")
+    except Exception as exc:
+        raise HTTPException(502, f"تعذر الاتصال بخدمة التحليل ({repr(exc)[:150]}) — أعد الضغط للاستئناف")
 
     if resp.status_code != 200:
         raise HTTPException(502, f"خطأ من خدمة التحليل: {resp.text[:300]}")
@@ -600,3 +600,38 @@ def analyze_search(search_id: int, data: AnalyzeIn, user_id: int = Depends(get_c
         remaining = cur.fetchone()["c"]
 
     return {"remaining": remaining, "total": total}
+
+
+# ================== تشخيص مؤقت (يُحذف لاحقاً) ==================
+@app.get("/api/diag")
+def diag():
+    out = {
+        "anthropic_key_set": bool(ANTHROPIC_API_KEY),
+        "key_prefix": (ANTHROPIC_API_KEY[:14] + "...") if ANTHROPIC_API_KEY else "",
+        "google_key_set": bool(GOOGLE_PLACES_API_KEY),
+    }
+    if not ANTHROPIC_API_KEY:
+        out["verdict"] = "المفتاح غير موجود — أضف ANTHROPIC_API_KEY في متغيرات خدمة data- في Railway"
+        return out
+    try:
+        r = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "قل: تم"}],
+            },
+            timeout=30,
+        )
+        out["status_code"] = r.status_code
+        out["response"] = r.text[:400]
+        out["verdict"] = "الاتصال يعمل ✅" if r.status_code == 200 else "الاتصال يصل لكن الخدمة ترفض — اقرأ response"
+    except Exception as exc:
+        out["error"] = repr(exc)[:400]
+        out["verdict"] = "فشل الاتصال الشبكي من الخادم إلى Anthropic — اقرأ error"
+    return out
