@@ -245,6 +245,7 @@ const T = {
     setDescHint:"مثال: وكالة تسويق رقمي نساعد العيادات والمطاعم على جذب عملاء عبر إعلانات انستقرام وقوقل",
     ai:"✨ تحليل ذكي", aiWorking:"جارٍ التحليل… (قد يستغرق دقيقة)",
     aiScore:(s)=>`ملاءمة ${s}/10`, aiDone:"اكتمل التحليل — رُتبت النتائج حسب الملاءمة",
+    aiProgress:(d,tot)=>`جارٍ التحليل… ${d}/${tot}`,
     msgCopy:"نسخ الرسالة", msgCopied:"تم نسخ الرسالة"
   },
   en: {
@@ -276,6 +277,7 @@ const T = {
     setDescHint:"e.g. Digital marketing agency helping clinics and restaurants get clients via Instagram and Google ads",
     ai:"✨ AI Analysis", aiWorking:"Analyzing… (may take a minute)",
     aiScore:(s)=>`Fit ${s}/10`, aiDone:"Analysis complete — results sorted by fit",
+    aiProgress:(d,tot)=>`Analyzing… ${d}/${tot}`,
     msgCopy:"Copy message", msgCopied:"Message copied"
   }
 };
@@ -475,9 +477,16 @@ async function runAnalyze(){
   const btn = $("aiBtn");
   btn.disabled = true; btn.textContent = t().aiWorking;
   try{
-    const d = await api(`/api/searches/${lastSearchId}/analyze`,
-      {method:"POST", body:JSON.stringify({language:lang})});
-    renderLeads(d.leads, lastQuery);
+    let remaining = 1, total = 0, guard = 0;
+    while(remaining > 0 && guard < 15){
+      const d = await api(`/api/searches/${lastSearchId}/analyze`,
+        {method:"POST", body:JSON.stringify({language:lang})});
+      remaining = d.remaining; total = d.total;
+      btn.textContent = t().aiProgress(total - remaining, total);
+      guard++;
+    }
+    const leads = await api(`/api/searches/${lastSearchId}/leads`);
+    renderLeads(leads, lastQuery);
     toast(t().aiDone);
   }catch(e){ toast(e.message, true); }
   btn.disabled = false; btn.textContent = t().ai;
