@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lead Finder — باحث العملاء</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;900&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --ink:#14231E; --muted:#5E7069; --line:#DDE5E1; --bg:#F6F8F7; --card:#FFFFFF;
+  --primary:#0E5A4E; --primary-dark:#0A423A; --wa:#1EBE5D; --wa-dark:#149C4A;
+  --sand:#C9A24B; --danger:#C0392B; --radius:14px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html[dir="rtl"] body{font-family:'Tajawal',sans-serif}
+html[dir="ltr"] body{font-family:'IBM Plex Sans','Tajawal',sans-serif}
+body{background:var(--bg);color:var(--ink);min-height:100vh;font-size:16px}
+.hidden{display:none!important}
+button{cursor:pointer;font-family:inherit;border:none}
+input{font-family:inherit}
+
+/* ---------- الهيدر ---------- */
+header{background:var(--primary-dark);color:#fff;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+.logo{font-weight:900;font-size:20px;letter-spacing:.3px}
+.logo span{color:#8FD8B7}
+.hdr-actions{display:flex;gap:8px;align-items:center}
+.pill{background:rgba(255,255,255,.12);color:#fff;border-radius:99px;padding:7px 14px;font-size:14px;font-weight:500}
+.pill:hover{background:rgba(255,255,255,.22)}
+
+/* ---------- شاشة الدخول ---------- */
+.auth-wrap{max-width:420px;margin:56px auto;padding:0 16px}
+.auth-card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:28px}
+.auth-card h1{font-size:24px;font-weight:900;margin-bottom:6px}
+.auth-card p{color:var(--muted);font-size:14px;margin-bottom:20px}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:13px;font-weight:700;margin-bottom:6px}
+.field input{width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:10px;font-size:15px;background:#FBFCFB}
+.field input:focus{outline:2px solid var(--primary);outline-offset:1px;border-color:var(--primary)}
+.btn-main{width:100%;background:var(--primary);color:#fff;padding:13px;border-radius:10px;font-size:16px;font-weight:700}
+.btn-main:hover{background:var(--primary-dark)}
+.btn-main:disabled{opacity:.6;cursor:wait}
+.switch-auth{text-align:center;margin-top:14px;font-size:14px;color:var(--muted)}
+.switch-auth a{color:var(--primary);font-weight:700;cursor:pointer;text-decoration:none}
+
+/* ---------- منطقة البحث (البطل) ---------- */
+.search-hero{max-width:760px;margin:40px auto 8px;padding:0 16px;text-align:center}
+.search-hero h2{font-size:26px;font-weight:900;margin-bottom:4px}
+.search-hero .sub{color:var(--muted);font-size:15px;margin-bottom:22px}
+.search-box{display:flex;gap:8px;background:var(--card);border:1.5px solid var(--line);border-radius:99px;padding:6px;box-shadow:0 4px 18px rgba(14,90,78,.07)}
+.search-box:focus-within{border-color:var(--primary)}
+.search-box input{flex:1;border:none;background:transparent;padding:10px 16px;font-size:16px;min-width:0}
+.search-box input:focus{outline:none}
+.search-box button{background:var(--primary);color:#fff;border-radius:99px;padding:11px 26px;font-size:15px;font-weight:700;white-space:nowrap}
+.search-box button:hover{background:var(--primary-dark)}
+.search-box button:disabled{opacity:.6;cursor:wait}
+.chips{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:14px}
+.chip{background:#E9F1EE;color:var(--primary-dark);border-radius:99px;padding:6px 14px;font-size:13px;font-weight:500}
+.chip:hover{background:#DCEAE5}
+
+/* ---------- التبويبات والنتائج ---------- */
+.container{max-width:1000px;margin:0 auto;padding:10px 16px 60px}
+.tabs{display:flex;gap:6px;margin:22px 0 14px;border-bottom:1px solid var(--line)}
+.tab{background:none;padding:10px 18px;font-size:15px;font-weight:700;color:var(--muted);border-bottom:2.5px solid transparent}
+.tab.active{color:var(--primary);border-bottom-color:var(--primary)}
+.status{text-align:center;color:var(--muted);padding:26px;font-size:15px}
+.count-bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;font-size:14px;color:var(--muted)}
+
+.lead{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:16px;margin-bottom:10px;display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap}
+.lead-info{flex:1;min-width:220px}
+.lead-name{font-size:17px;font-weight:700;margin-bottom:3px}
+.lead-addr{color:var(--muted);font-size:13.5px;margin-bottom:6px}
+.lead-meta{display:flex;gap:12px;flex-wrap:wrap;font-size:13.5px}
+.rating{color:var(--sand);font-weight:700}
+.lead-phone{direction:ltr;unicode-bidi:embed;font-weight:600}
+.lead-actions{display:flex;gap:8px;flex-wrap:wrap}
+.btn-wa{background:var(--wa);color:#fff;border-radius:10px;padding:10px 16px;font-size:14px;font-weight:700;text-decoration:none;display:inline-flex;align-items:center;gap:6px}
+.btn-wa:hover{background:var(--wa-dark)}
+.btn-sec{background:#EEF3F1;color:var(--ink);border-radius:10px;padding:10px 14px;font-size:14px;font-weight:600;text-decoration:none;display:inline-flex;align-items:center}
+.btn-sec:hover{background:#E2EAE6}
+.no-wa{color:var(--muted);font-size:13px;padding:10px 4px}
+
+.hist{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;cursor:pointer}
+.hist:hover{border-color:var(--primary)}
+.hist .q{font-weight:700}
+.hist .m{color:var(--muted);font-size:13px;margin-top:2px}
+.hist .n{background:#E9F1EE;color:var(--primary-dark);border-radius:99px;padding:4px 12px;font-size:13px;font-weight:700}
+
+.toast{position:fixed;bottom:24px;inset-inline-start:50%;transform:translateX(50%);background:var(--ink);color:#fff;padding:12px 22px;border-radius:99px;font-size:14px;z-index:99;opacity:0;transition:.3s;pointer-events:none}
+html[dir="ltr"] .toast{transform:translateX(-50%)}
+.toast.show{opacity:1}
+.toast.err{background:var(--danger)}
+
+@media (max-width:560px){
+  .search-hero h2{font-size:21px}
+  .lead{flex-direction:column}
+  .lead-actions{width:100%}
+  .btn-wa{flex:1;justify-content:center}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo" id="logo">Lead<span>Finder</span></div>
+  <div class="hdr-actions">
+    <button class="pill" id="langBtn" onclick="toggleLang()">English</button>
+    <button class="pill hidden" id="logoutBtn" onclick="logout()"></button>
+  </div>
+</header>
+
+<!-- شاشة الدخول -->
+<div class="auth-wrap" id="authScreen">
+  <div class="auth-card">
+    <h1 id="authTitle"></h1>
+    <p id="authSub"></p>
+    <div class="field" id="companyField">
+      <label id="lblCompany"></label>
+      <input id="inCompany" type="text">
+    </div>
+    <div class="field">
+      <label id="lblEmail"></label>
+      <input id="inEmail" type="email" dir="ltr">
+    </div>
+    <div class="field">
+      <label id="lblPassword"></label>
+      <input id="inPassword" type="password" dir="ltr">
+    </div>
+    <button class="btn-main" id="authBtn" onclick="submitAuth()"></button>
+    <div class="switch-auth"><span id="switchTxt"></span> <a id="switchLink" onclick="toggleAuthMode()"></a></div>
+  </div>
+</div>
+
+<!-- الشاشة الرئيسية -->
+<div id="appScreen" class="hidden">
+  <div class="search-hero">
+    <h2 id="heroTitle"></h2>
+    <div class="sub" id="heroSub"></div>
+    <div class="search-box">
+      <input id="inQuery" type="text" onkeydown="if(event.key==='Enter')runSearch()">
+      <button id="searchBtn" onclick="runSearch()"></button>
+    </div>
+    <div class="chips" id="chips"></div>
+  </div>
+
+  <div class="container">
+    <div class="tabs">
+      <button class="tab active" id="tabResults" onclick="showTab('results')"></button>
+      <button class="tab" id="tabHistory" onclick="showTab('history')"></button>
+    </div>
+    <div id="panelResults">
+      <div class="count-bar hidden" id="countBar"><span id="countTxt"></span></div>
+      <div id="resultsList"><div class="status" id="emptyResults"></div></div>
+    </div>
+    <div id="panelHistory" class="hidden">
+      <div id="historyList"><div class="status" id="emptyHistory"></div></div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+/* ---------------- النصوص ---------------- */
+const T = {
+  ar: {
+    langBtn:"English", logout:"تسجيل الخروج",
+    loginTitle:"تسجيل الدخول", registerTitle:"إنشاء حساب جديد",
+    loginSub:"ادخل للوصول إلى قوائم عملائك", registerSub:"ابدأ بتوليد عملاء حقيقيين خلال دقيقة",
+    company:"اسم شركتك (يظهر في ملفات PDF لاحقاً)", email:"البريد الإلكتروني", password:"كلمة المرور",
+    loginBtn:"دخول", registerBtn:"إنشاء الحساب",
+    noAccount:"ليس لديك حساب؟", haveAccount:"لديك حساب؟",
+    createOne:"أنشئ حساباً", loginLink:"سجّل الدخول",
+    heroTitle:"اكتب القطاع والمدينة… واحصل على عملاء جاهزين",
+    heroSub:"أرقام حقيقية مع رابط واتساب مباشر لكل شركة",
+    searchPlaceholder:"مثال: عيادات أسنان دبي", searchBtn:"ابحث", searching:"جارٍ البحث…",
+    chips:["عيادات أسنان دبي","مكاتب عقارات الشارقة","مطاعم أبوظبي","صالونات تجميل العين"],
+    tabResults:"النتائج", tabHistory:"سجل البحث",
+    emptyResults:"لا توجد نتائج بعد — ابدأ بحثك الأول من الأعلى",
+    emptyHistory:"لا يوجد سجل بحث بعد",
+    resultsFor:(n,q)=>`${n} عميل محتمل لبحث: «${q}»`,
+    whatsapp:"واتساب", website:"الموقع", maps:"خرائط", noPhone:"لا يوجد رقم منشور",
+    reviews:"تقييم", loading:"جارٍ التحميل…",
+    errNetwork:"تعذر الاتصال بالخادم", done:(n)=>`تم العثور على ${n} عميل محتمل`
+  },
+  en: {
+    langBtn:"عربي", logout:"Log out",
+    loginTitle:"Log in", registerTitle:"Create account",
+    loginSub:"Access your lead lists", registerSub:"Start generating real leads in a minute",
+    company:"Company name (used in PDF exports later)", email:"Email", password:"Password",
+    loginBtn:"Log in", registerBtn:"Create account",
+    noAccount:"No account?", haveAccount:"Have an account?",
+    createOne:"Create one", loginLink:"Log in",
+    heroTitle:"Type a sector and city… get ready-to-contact leads",
+    heroSub:"Real phone numbers with a direct WhatsApp link for every business",
+    searchPlaceholder:"e.g. dental clinics Dubai", searchBtn:"Search", searching:"Searching…",
+    chips:["dental clinics Dubai","real estate offices Sharjah","restaurants Abu Dhabi","beauty salons Al Ain"],
+    tabResults:"Results", tabHistory:"Search history",
+    emptyResults:"No results yet — run your first search above",
+    emptyHistory:"No search history yet",
+    resultsFor:(n,q)=>`${n} leads for: "${q}"`,
+    whatsapp:"WhatsApp", website:"Website", maps:"Maps", noPhone:"No published phone",
+    reviews:"reviews", loading:"Loading…",
+    errNetwork:"Could not reach the server", done:(n)=>`Found ${n} leads`
+  }
+};
+
+let lang = localStorage.getItem("lf_lang") || "ar";
+let authMode = "login";
+let token = localStorage.getItem("lf_token") || "";
+
+const $ = id => document.getElementById(id);
+const t = () => T[lang];
+
+/* ---------------- اللغة ---------------- */
+function applyLang(){
+  document.documentElement.lang = lang;
+  document.documentElement.dir = lang === "ar" ? "rtl" : "ltr";
+  $("langBtn").textContent = t().langBtn;
+  $("logoutBtn").textContent = t().logout;
+  $("lblCompany").textContent = t().company;
+  $("lblEmail").textContent = t().email;
+  $("lblPassword").textContent = t().password;
+  $("heroTitle").textContent = t().heroTitle;
+  $("heroSub").textContent = t().heroSub;
+  $("inQuery").placeholder = t().searchPlaceholder;
+  $("searchBtn").textContent = t().searchBtn;
+  $("tabResults").textContent = t().tabResults;
+  $("tabHistory").textContent = t().tabHistory;
+  $("emptyResults") && ($("emptyResults").textContent = t().emptyResults);
+  $("emptyHistory") && ($("emptyHistory").textContent = t().emptyHistory);
+  $("chips").innerHTML = t().chips.map(c =>
+    `<button class="chip" onclick="useChip(this)">${c}</button>`).join("");
+  applyAuthMode();
+}
+function toggleLang(){ lang = lang === "ar" ? "en" : "ar"; localStorage.setItem("lf_lang", lang); applyLang(); }
+function useChip(el){ $("inQuery").value = el.textContent; runSearch(); }
+
+/* ---------------- المصادقة ---------------- */
+function applyAuthMode(){
+  const login = authMode === "login";
+  $("authTitle").textContent = login ? t().loginTitle : t().registerTitle;
+  $("authSub").textContent = login ? t().loginSub : t().registerSub;
+  $("authBtn").textContent = login ? t().loginBtn : t().registerBtn;
+  $("switchTxt").textContent = login ? t().noAccount : t().haveAccount;
+  $("switchLink").textContent = login ? t().createOne : t().loginLink;
+  $("companyField").classList.toggle("hidden", login);
+}
+function toggleAuthMode(){ authMode = authMode === "login" ? "register" : "login"; applyAuthMode(); }
+
+async function submitAuth(){
+  const btn = $("authBtn"); btn.disabled = true;
+  try{
+    const path = authMode === "login" ? "/api/login" : "/api/register";
+    const body = { email:$("inEmail").value, password:$("inPassword").value };
+    if(authMode === "register") body.company_name = $("inCompany").value;
+    const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.detail || t().errNetwork);
+    token = d.token;
+    localStorage.setItem("lf_token", token);
+    showApp();
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false;
+}
+function logout(){ token=""; localStorage.removeItem("lf_token"); location.reload(); }
+
+/* ---------------- الشاشات ---------------- */
+function showApp(){
+  $("authScreen").classList.add("hidden");
+  $("appScreen").classList.remove("hidden");
+  $("logoutBtn").classList.remove("hidden");
+  loadHistory();
+}
+function showTab(name){
+  $("tabResults").classList.toggle("active", name==="results");
+  $("tabHistory").classList.toggle("active", name==="history");
+  $("panelResults").classList.toggle("hidden", name!=="results");
+  $("panelHistory").classList.toggle("hidden", name!=="history");
+  if(name==="history") loadHistory();
+}
+
+/* ---------------- الطلبات ---------------- */
+async function api(path, opts={}){
+  const r = await fetch(path, {...opts, headers:{
+    "Content-Type":"application/json",
+    "Authorization":"Bearer "+token,
+    ...(opts.headers||{})
+  }});
+  if(r.status === 401){ logout(); return; }
+  const d = await r.json();
+  if(!r.ok) throw new Error(d.detail || t().errNetwork);
+  return d;
+}
+
+/* ---------------- البحث ---------------- */
+async function runSearch(){
+  const q = $("inQuery").value.trim();
+  if(!q) return;
+  const btn = $("searchBtn");
+  btn.disabled = true; btn.textContent = t().searching;
+  showTab("results");
+  $("resultsList").innerHTML = `<div class="status">${t().searching}</div>`;
+  $("countBar").classList.add("hidden");
+  try{
+    const d = await api("/api/search", {method:"POST", body:JSON.stringify({query:q, language:lang})});
+    renderLeads(d.leads, q);
+    toast(t().done(d.count));
+  }catch(e){
+    $("resultsList").innerHTML = `<div class="status">${e.message}</div>`;
+    toast(e.message, true);
+  }
+  btn.disabled = false; btn.textContent = t().searchBtn;
+}
+
+function esc(s){ return (s||"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+function renderLeads(leads, query){
+  if(!leads.length){
+    $("resultsList").innerHTML = `<div class="status">${t().emptyResults}</div>`;
+    return;
+  }
+  $("countBar").classList.remove("hidden");
+  $("countTxt").textContent = t().resultsFor(leads.length, query);
+  $("resultsList").innerHTML = leads.map(l => `
+    <div class="lead">
+      <div class="lead-info">
+        <div class="lead-name">${esc(l.name)}</div>
+        <div class="lead-addr">${esc(l.address)}</div>
+        <div class="lead-meta">
+          ${l.rating ? `<span class="rating">★ ${l.rating}</span><span>(${l.reviews_count||0} ${t().reviews})</span>` : ""}
+          ${l.phone ? `<span class="lead-phone">${esc(l.phone)}</span>` : ""}
+        </div>
+      </div>
+      <div class="lead-actions">
+        ${l.whatsapp
+          ? `<a class="btn-wa" href="${esc(l.whatsapp)}" target="_blank" rel="noopener">💬 ${t().whatsapp}</a>`
+          : `<span class="no-wa">${t().noPhone}</span>`}
+        ${l.website ? `<a class="btn-sec" href="${esc(l.website)}" target="_blank" rel="noopener">${t().website}</a>` : ""}
+        ${l.maps_url ? `<a class="btn-sec" href="${esc(l.maps_url)}" target="_blank" rel="noopener">${t().maps}</a>` : ""}
+      </div>
+    </div>`).join("");
+}
+
+/* ---------------- السجل ---------------- */
+async function loadHistory(){
+  try{
+    const items = await api("/api/searches");
+    if(!items || !items.length){
+      $("historyList").innerHTML = `<div class="status">${t().emptyHistory}</div>`;
+      return;
+    }
+    $("historyList").innerHTML = items.map(s => `
+      <div class="hist" onclick="openSearch(${s.id}, '${esc(s.query).replace(/'/g,"\\'")}')">
+        <div>
+          <div class="q">${esc(s.query)}</div>
+          <div class="m">${new Date(s.created_at).toLocaleString(lang==="ar"?"ar-AE":"en-GB")}</div>
+        </div>
+        <span class="n">${s.results_count}</span>
+      </div>`).join("");
+  }catch(e){ /* تجاهل */ }
+}
+
+async function openSearch(id, query){
+  showTab("results");
+  $("resultsList").innerHTML = `<div class="status">${t().loading}</div>`;
+  try{
+    const leads = await api(`/api/searches/${id}/leads`);
+    renderLeads(leads, query);
+  }catch(e){ toast(e.message, true); }
+}
+
+/* ---------------- إشعارات ---------------- */
+let toastTimer;
+function toast(msg, err=false){
+  const el = $("toast");
+  el.textContent = msg;
+  el.className = "toast show" + (err ? " err" : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(()=> el.className = "toast", 3000);
+}
+
+/* ---------------- البداية ---------------- */
+applyLang();
+if(token) showApp();
+</script>
+</body>
+</html>
