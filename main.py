@@ -86,6 +86,10 @@ def init_db():
             UNIQUE (user_id, place_id)
         );
         ALTER TABLE users ADD COLUMN IF NOT EXISTS logo_base64 TEXT DEFAULT '';
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS business_description TEXT DEFAULT '';
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS ai_score REAL;
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS ai_reason TEXT DEFAULT '';
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS ai_message TEXT DEFAULT '';
         """)
 
 
@@ -142,6 +146,7 @@ class LoginIn(BaseModel):
 class SearchIn(BaseModel):
     query: str
     language: str = "ar"  # لغة نتائج Google
+    strict_city: bool = True  # استبعاد النتائج خارج المدينة المكتوبة
 
 # ---------------- المصادقة ----------------
 @app.post("/api/register")
@@ -201,25 +206,45 @@ def search(data: SearchIn, user_id: int = Depends(get_current_user)):
         "Content-Type": "application/json",
         "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
         "X-Goog-FieldMask": (
-            "places.id,places.displayName,places.formattedAddress,"
+            "nextPageToken,places.id,places.displayName,places.formattedAddress,"
             "places.internationalPhoneNumber,places.nationalPhoneNumber,"
             "places.rating,places.userRatingCount,places.websiteUri,places.googleMapsUri"
         ),
     }
-    body = {"textQuery": query, "languageCode": data.language, "maxResultCount": 20}
 
-    try:
-        resp = httpx.post(
-            "https://places.googleapis.com/v1/places:searchText",
-            headers=headers, json=body, timeout=30,
-        )
-    except Exception:
-        raise HTTPException(502, "تعذر الاتصال بخدمة Google")
+    # نجلب حتى 3 صفحات (60 نتيجة كحد أقصى)
+    places, page_token = [], None
+    for _ in range(3):
+        body = {"textQuery": query, "languageCode": data.language, "maxResultCount": 20}
+        if page_token:
+            body["pageToken"] = page_token
+        try:
+            resp = httpx.post(
+                "https://places.googleapis.com/v1/places:searchText",
+                headers=headers, json=body, timeout=30,
+            )
+        except Exception:
+            if places:
+                break
+            raise HTTPException(502, "تعذر الاتصال بخدمة Google")
+        if resp.status_code != 200:
+            if places:
+                break
+            raise HTTPException(502, f"خطأ من Google Places: {resp.text[:300]}")
+        j = resp.json()
+        places.extend(j.get("places", []))
+        page_token = j.get("nextPageToken")
+        if not page_token:
+            break
 
-    if resp.status_code != 200:
-        raise HTTPException(502, f"خطأ من Google Places: {resp.text[:300]}")
-
-    places = resp.json().get("places", [])
+    # فلتر المدينة: نستبعد النتائج التي لا يظهر في عنوانها آخر كلمة من البحث (اسم المدينة عادةً)
+    if data.strict_city:
+        tokens = [w for w in re.split(r"\s+", query) if len(w) >= 3]
+        if len(tokens) >= 2:  # لا نفلتر إذا كان البحث كلمة واحدة
+            city = tokens[-1].lower()
+            filtered = [p for p in places if city in (p.get("formattedAddress", "") or "").lower()]
+            if filtered:  # إذا الفلتر صفّر النتائج نبقي الأصل بدل صفحة فارغة
+                places = filtered
 
     with get_db() as conn:
         cur = conn.cursor()
@@ -325,15 +350,20 @@ def ensure_fonts():
 class CompanyIn(BaseModel):
     company_name: str = ""
     logo_base64: str = ""  # data:image/...;base64,xxxx
+    business_description: str = ""  # وصف نشاط المستخدم — يستخدمه التحليل الذكي
 
 
 @app.get("/api/company")
 def get_company(user_id: int = Depends(get_current_user)):
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT company_name, logo_base64 FROM users WHERE id=%s", (user_id,))
+        cur.execute("SELECT company_name, logo_base64, business_description FROM users WHERE id=%s", (user_id,))
         row = cur.fetchone()
-    return {"company_name": row["company_name"] or "", "logo_base64": row["logo_base64"] or ""}
+    return {
+        "company_name": row["company_name"] or "",
+        "logo_base64": row["logo_base64"] or "",
+        "business_description": row.get("business_description") or "",
+    }
 
 
 @app.post("/api/company")
@@ -343,8 +373,8 @@ def save_company(data: CompanyIn, user_id: int = Depends(get_current_user)):
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE users SET company_name=%s, logo_base64=%s WHERE id=%s",
-            (data.company_name.strip(), data.logo_base64, user_id),
+            "UPDATE users SET company_name=%s, logo_base64=%s, business_description=%s WHERE id=%s",
+            (data.company_name.strip(), data.logo_base64, data.business_description.strip(), user_id),
         )
     return {"ok": True}
 
@@ -453,3 +483,110 @@ tr:nth-child(even) td {{ background:#F3F7F5; }}
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="leads-{search_id}.pdf"'},
     )
+
+# ================== المرحلة 3: التحليل الذكي (Claude Haiku) ==================
+import json
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+
+class AnalyzeIn(BaseModel):
+    language: str = "ar"
+
+
+@app.post("/api/searches/{search_id}/analyze")
+def analyze_search(search_id: int, data: AnalyzeIn, user_id: int = Depends(get_current_user)):
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(500, "ANTHROPIC_API_KEY غير مضبوط في Railway — أضفه من تبويب Variables")
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT company_name, business_description FROM users WHERE id=%s", (user_id,))
+        user = cur.fetchone()
+        cur.execute("SELECT query FROM searches WHERE id=%s AND user_id=%s", (search_id, user_id))
+        s = cur.fetchone()
+        if not s:
+            raise HTTPException(404, "البحث غير موجود")
+        cur.execute(
+            "SELECT id, place_id, name, address, rating, reviews_count, website "
+            "FROM leads WHERE user_id=%s AND search_id=%s",
+            (user_id, search_id),
+        )
+        leads = cur.fetchall()
+
+    desc = (user.get("business_description") or "").strip()
+    if not desc:
+        raise HTTPException(400, "أضف وصف نشاطك التجاري في «إعدادات الشركة» أولاً حتى يعرف التحليل ماذا تبيع ولمن")
+    if not leads:
+        raise HTTPException(400, "لا توجد نتائج لتحليلها")
+
+    lang_name = "العربية" if data.language == "ar" else "English"
+    leads_json = json.dumps([{
+        "place_id": l["place_id"],
+        "name": l["name"],
+        "address": l["address"],
+        "rating": l["rating"],
+        "reviews": l["reviews_count"],
+        "has_website": bool(l["website"]),
+    } for l in leads], ensure_ascii=False)
+
+    prompt = f"""أنت محلل مبيعات خبير. مستخدم اسمه/شركته: «{user['company_name'] or 'غير محدد'}».
+وصف نشاطه وما يبيعه: «{desc}»
+بحث عن عملاء محتملين بكلمات: «{s['query']}» وحصل على قائمة الشركات أدناه.
+
+لكل شركة قيّم مدى ملاءمتها كعميل محتمل لهذا النشاط تحديداً، واكتب:
+- score: رقم من 1 إلى 10 (10 = عميل مثالي جداً)
+- reason: سبب التقييم في جملة واحدة بلغة {lang_name}
+- message: رسالة واتساب افتتاحية موجهة لهذه الشركة بالاسم، بلغة {lang_name}، ودية ومهنية بلا مبالغة تسويقية، 2-3 جمل قصيرة، تنتهي بسؤال بسيط يفتح الحوار. لا تذكر أنك وجدتهم عبر بحث.
+
+الشركات:
+{leads_json}
+
+أعد فقط JSON بهذا الشكل بدون أي نص قبله أو بعده وبدون علامات تنسيق:
+[{{"place_id": "...", "score": 8, "reason": "...", "message": "..."}}]"""
+
+    try:
+        resp = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5",
+                "max_tokens": 6000,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=120,
+        )
+    except Exception:
+        raise HTTPException(502, "تعذر الاتصال بخدمة التحليل")
+
+    if resp.status_code != 200:
+        raise HTTPException(502, f"خطأ من خدمة التحليل: {resp.text[:300]}")
+
+    text = "".join(b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text")
+    clean = re.sub(r"```json|```", "", text).strip()
+    try:
+        items = json.loads(clean)
+    except Exception:
+        raise HTTPException(502, "تعذر قراءة نتيجة التحليل — أعد المحاولة")
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        for it in items:
+            cur.execute(
+                "UPDATE leads SET ai_score=%s, ai_reason=%s, ai_message=%s "
+                "WHERE user_id=%s AND search_id=%s AND place_id=%s",
+                (it.get("score"), it.get("reason", ""), it.get("message", ""),
+                 user_id, search_id, it.get("place_id", "")),
+            )
+        cur.execute(
+            "SELECT * FROM leads WHERE user_id=%s AND search_id=%s "
+            "ORDER BY ai_score DESC NULLS LAST, rating DESC NULLS LAST",
+            (user_id, search_id),
+        )
+        result = cur.fetchall()
+
+    return {"count": len(result), "leads": result}
