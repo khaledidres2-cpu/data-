@@ -444,11 +444,14 @@ def search_pdf(search_id: int, lang: str = "ar", user_id: int = Depends(get_curr
 @font-face {{ font-family:'Tajawal'; src:url('file://{FONT_DIR}/Tajawal-Bold.ttf'); font-weight:700; }}
 @page {{ size:A4; margin:14mm 12mm; }}
 body {{ font-family:'Tajawal'; color:#14231E; font-size:11px; }}
-.head {{ display:flex; justify-content:space-between; align-items:center;
-        border-bottom:3px solid #0E5A4E; padding-bottom:10px; margin-bottom:14px; }}
-.brand {{ display:flex; align-items:center; gap:10px; }}
-.logo {{ max-height:52px; max-width:120px; }}
-.cname {{ font-size:17px; font-weight:700; color:#0E5A4E; }}
+table.head {{ width:100%; border-collapse:collapse; margin-bottom:14px;
+        border-bottom:3px solid #0E5A4E; }}
+table.head td {{ border:none; background:none; padding:0 0 10px 0; vertical-align:middle; }}
+.brand-cell {{ text-align:{tx['align']}; }}
+.title-cell {{ text-align:{'left' if tx['align'] == 'right' else 'right'}; }}
+.logo {{ max-height:48px; max-width:110px; vertical-align:middle; }}
+.cname {{ font-size:17px; font-weight:700; color:#0E5A4E; display:inline-block;
+        vertical-align:middle; margin:0 8px; }}
 h1 {{ font-size:16px; margin:0; color:#0E5A4E; }}
 .meta {{ color:#5E7069; font-size:10.5px; margin-bottom:12px; }}
 .meta span {{ margin-inline-end:16px; }}
@@ -463,10 +466,10 @@ tr:nth-child(even) td {{ background:#F3F7F5; }}
 .footer {{ margin-top:14px; text-align:center; color:#8CA29A; font-size:9.5px; }}
 </style></head>
 <body>
-<div class="head">
-  <div class="brand">{logo_html}<div class="cname">{company}</div></div>
-  <h1>{tx['title']}</h1>
-</div>
+<table class="head"><tr>
+  <td class="brand-cell">{logo_html}<span class="cname">{company}</span></td>
+  <td class="title-cell"><h1>{tx['title']}</h1></td>
+</tr></table>
 <div class="meta">
   <span><b>{tx['search']}:</b> {e(s['query'])}</span>
   <span><b>{tx['date']}:</b> {s['created_at'].strftime('%Y-%m-%d')}</span>
