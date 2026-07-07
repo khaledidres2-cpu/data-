@@ -37,6 +37,9 @@ header{background:var(--primary-dark);color:#fff;padding:14px 20px;display:flex;
 .field label{display:block;font-size:13px;font-weight:700;margin-bottom:6px}
 .field input{width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:10px;font-size:15px;background:#FBFCFB}
 .field input:focus{outline:2px solid var(--primary);outline-offset:1px;border-color:var(--primary)}
+.field textarea{width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:10px;font-size:14.5px;background:#FBFCFB;font-family:inherit;resize:vertical;min-height:76px}
+.field textarea:focus{outline:2px solid var(--primary);outline-offset:1px;border-color:var(--primary)}
+.field .hint{font-size:12px;color:var(--muted);margin-top:4px}
 .btn-main{width:100%;background:var(--primary);color:#fff;padding:13px;border-radius:10px;font-size:16px;font-weight:700}
 .btn-main:hover{background:var(--primary-dark)}
 .btn-main:disabled{opacity:.6;cursor:wait}
@@ -55,6 +58,9 @@ header{background:var(--primary-dark);color:#fff;padding:14px 20px;display:flex;
 .search-box button:hover{background:var(--primary-dark)}
 .search-box button:disabled{opacity:.6;cursor:wait}
 .chips{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:14px}
+.filter-row{display:flex;justify-content:center;margin-top:12px}
+.filter-row label{display:flex;align-items:center;gap:7px;font-size:14px;color:var(--muted);cursor:pointer;font-weight:500}
+.filter-row input{width:17px;height:17px;accent-color:var(--primary);cursor:pointer}
 .chip{background:#E9F1EE;color:var(--primary-dark);border-radius:99px;padding:6px 14px;font-size:13px;font-weight:500}
 .chip:hover{background:#DCEAE5}
 
@@ -99,6 +105,12 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
 .modal-actions{display:flex;gap:8px;margin-top:18px}
 .btn-ghost{flex:1;background:#EEF3F1;color:var(--ink);padding:12px;border-radius:10px;font-size:15px;font-weight:600}
 .modal-actions .btn-main{flex:1;width:auto}
+.btn-ai{background:#7C3AED;color:#fff;border-radius:10px;padding:9px 18px;font-size:14px;font-weight:700}
+.btn-ai:hover{background:#6D28D9}
+.btn-ai:disabled{opacity:.6;cursor:wait}
+.bar-actions{display:flex;gap:8px}
+.ai-badge{background:#F1EAFD;color:#6D28D9;border-radius:99px;padding:4px 12px;font-size:13px;font-weight:900}
+.ai-reason{color:#6D28D9;font-size:13px;margin-top:6px;line-height:1.5}
 .btn-pdf{background:var(--primary);color:#fff;border-radius:10px;padding:9px 18px;font-size:14px;font-weight:700}
 .btn-pdf:hover{background:var(--primary-dark)}
 .btn-pdf:disabled{opacity:.6;cursor:wait}
@@ -154,6 +166,9 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
       <input id="inQuery" type="text" onkeydown="if(event.key==='Enter')runSearch()">
       <button id="searchBtn" onclick="runSearch()"></button>
     </div>
+    <div class="filter-row">
+      <label><input type="checkbox" id="strictCity" checked> <span id="strictLbl"></span></label>
+    </div>
     <div class="chips" id="chips"></div>
   </div>
 
@@ -163,7 +178,7 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
       <button class="tab" id="tabHistory" onclick="showTab('history')"></button>
     </div>
     <div id="panelResults">
-      <div class="count-bar hidden" id="countBar"><span id="countTxt"></span><button class="btn-pdf" id="pdfBtn" onclick="downloadPDF()"></button></div>
+      <div class="count-bar hidden" id="countBar"><span id="countTxt"></span><div class="bar-actions"><button class="btn-ai" id="aiBtn" onclick="runAnalyze()"></button><button class="btn-pdf" id="pdfBtn" onclick="downloadPDF()"></button></div></div>
       <div id="resultsList"><div class="status" id="emptyResults"></div></div>
     </div>
     <div id="panelHistory" class="hidden">
@@ -178,6 +193,11 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
     <div class="field">
       <label id="setLblName"></label>
       <input id="setCompany" type="text">
+    </div>
+    <div class="field">
+      <label id="setLblDesc"></label>
+      <textarea id="setDesc"></textarea>
+      <div class="hint" id="setDescHint"></div>
     </div>
     <div class="field">
       <label id="setLblLogo"></label>
@@ -219,7 +239,13 @@ const T = {
     setName:"اسم الشركة (يظهر في ملف PDF)", setLogo:"شعار الشركة (يظهر في ملف PDF)",
     save:"حفظ", cancel:"إلغاء", saved:"تم الحفظ",
     pdf:"⬇ تحميل PDF", pdfWorking:"جارٍ التوليد…", pdfHint:"أضف اسم شركتك وشعارك من «إعدادات الشركة» ليظهرا في الملف",
-    call:"اتصال", copy:"نسخ", copied:"تم نسخ الرقم", logoTooBig:"الصورة كبيرة — اختر صورة أقل من 1.5MB"
+    call:"اتصال", copy:"نسخ", copied:"تم نسخ الرقم", logoTooBig:"الصورة كبيرة — اختر صورة أقل من 1.5MB",
+    strictCity:"نتائج المدينة المكتوبة فقط",
+    setDesc:"وصف نشاطك (للتحليل الذكي)",
+    setDescHint:"مثال: وكالة تسويق رقمي نساعد العيادات والمطاعم على جذب عملاء عبر إعلانات انستقرام وقوقل",
+    ai:"✨ تحليل ذكي", aiWorking:"جارٍ التحليل… (قد يستغرق دقيقة)",
+    aiScore:(s)=>`ملاءمة ${s}/10`, aiDone:"اكتمل التحليل — رُتبت النتائج حسب الملاءمة",
+    msgCopy:"نسخ الرسالة", msgCopied:"تم نسخ الرسالة"
   },
   en: {
     langBtn:"عربي", logout:"Log out",
@@ -244,7 +270,13 @@ const T = {
     setName:"Company name (shown in PDF)", setLogo:"Company logo (shown in PDF)",
     save:"Save", cancel:"Cancel", saved:"Saved",
     pdf:"⬇ Download PDF", pdfWorking:"Generating…", pdfHint:"Add your company name and logo in Company settings to show them in the file",
-    call:"Call", copy:"Copy", copied:"Number copied", logoTooBig:"Image too large — pick one under 1.5MB"
+    call:"Call", copy:"Copy", copied:"Number copied", logoTooBig:"Image too large — pick one under 1.5MB",
+    strictCity:"Only results in the typed city",
+    setDesc:"Your business description (for AI analysis)",
+    setDescHint:"e.g. Digital marketing agency helping clinics and restaurants get clients via Instagram and Google ads",
+    ai:"✨ AI Analysis", aiWorking:"Analyzing… (may take a minute)",
+    aiScore:(s)=>`Fit ${s}/10`, aiDone:"Analysis complete — results sorted by fit",
+    msgCopy:"Copy message", msgCopied:"Message copied"
   }
 };
 
@@ -268,6 +300,10 @@ function applyLang(){
   $("setCancel").textContent = t().cancel;
   $("setSave").textContent = t().save;
   $("pdfBtn").textContent = t().pdf;
+  $("strictLbl").textContent = t().strictCity;
+  $("setLblDesc").textContent = t().setDesc;
+  $("setDescHint").textContent = t().setDescHint;
+  $("aiBtn").textContent = t().ai;
   $("lblCompany").textContent = t().company;
   $("lblEmail").textContent = t().email;
   $("lblPassword").textContent = t().password;
@@ -355,8 +391,8 @@ async function runSearch(){
   $("resultsList").innerHTML = `<div class="status">${t().searching}</div>`;
   $("countBar").classList.add("hidden");
   try{
-    const d = await api("/api/search", {method:"POST", body:JSON.stringify({query:q, language:lang})});
-    lastSearchId = d.search_id;
+    const d = await api("/api/search", {method:"POST", body:JSON.stringify({query:q, language:lang, strict_city:$("strictCity").checked})});
+    lastSearchId = d.search_id; lastQuery = q;
     renderLeads(d.leads, q);
     toast(t().done(d.count));
   }catch(e){
@@ -378,7 +414,7 @@ function renderLeads(leads, query){
   $("resultsList").innerHTML = leads.map(l => `
     <div class="lead">
       <div class="lead-info">
-        <div class="lead-name">${esc(l.name)}</div>
+        <div class="lead-name">${esc(l.name)} ${l.ai_score ? `<span class="ai-badge">${t().aiScore(l.ai_score)}</span>` : ""}</div>
         <div class="lead-addr">${esc(l.address)}</div>
         <div class="lead-meta">
           ${l.rating ? `<span class="rating">★ ${l.rating}</span><span>(${l.reviews_count||0} ${t().reviews})</span>` : ""}
@@ -387,11 +423,13 @@ function renderLeads(leads, query){
         <div class="lead-meta" style="margin-top:8px">
           ${l.phone ? `<a class="btn-mini" href="tel:${esc(l.phone).replace(/\s/g,'')}">📞 ${t().call}</a>
           <button class="btn-mini" onclick="copyPhone('${esc(l.phone)}')">📋 ${t().copy}</button>` : ""}
+          ${l.ai_message ? `<button class="btn-mini" data-msg="${esc(l.ai_message)}" onclick="copyMsg(this)">💬 ${t().msgCopy}</button>` : ""}
         </div>
+        ${l.ai_reason ? `<div class="ai-reason">${esc(l.ai_reason)}</div>` : ""}
       </div>
       <div class="lead-actions">
         ${l.whatsapp
-          ? `<a class="btn-wa" href="${esc(l.whatsapp)}" target="_blank" rel="noopener">💬 ${t().whatsapp}</a>`
+          ? `<a class="btn-wa" href="${esc(l.whatsapp)}${l.ai_message ? '?text='+encodeURIComponent(l.ai_message) : ''}" target="_blank" rel="noopener">💬 ${t().whatsapp}</a>`
           : `<span class="no-wa">${t().noPhone}</span>`}
         ${l.website ? `<a class="btn-sec" href="${esc(l.website)}" target="_blank" rel="noopener">${t().website}</a>` : ""}
         ${l.maps_url ? `<a class="btn-sec" href="${esc(l.maps_url)}" target="_blank" rel="noopener">${t().maps}</a>` : ""}
@@ -423,13 +461,30 @@ async function openSearch(id, query){
   $("resultsList").innerHTML = `<div class="status">${t().loading}</div>`;
   try{
     const leads = await api(`/api/searches/${id}/leads`);
-    lastSearchId = id;
+    lastSearchId = id; lastQuery = query;
     renderLeads(leads, query);
   }catch(e){ toast(e.message, true); }
 }
 
 /* ---------------- الشركة وPDF والنسخ ---------------- */
 let lastSearchId = null;
+let lastQuery = "";
+
+async function runAnalyze(){
+  if(!lastSearchId) return;
+  const btn = $("aiBtn");
+  btn.disabled = true; btn.textContent = t().aiWorking;
+  try{
+    const d = await api(`/api/searches/${lastSearchId}/analyze`,
+      {method:"POST", body:JSON.stringify({language:lang})});
+    renderLeads(d.leads, lastQuery);
+    toast(t().aiDone);
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = t().ai;
+}
+function copyMsg(btn){
+  navigator.clipboard.writeText(btn.dataset.msg).then(()=>toast(t().msgCopied)).catch(()=>{});
+}
 let companyData = {company_name:"", logo_base64:""};
 
 async function loadCompany(){
@@ -437,6 +492,7 @@ async function loadCompany(){
 }
 function openSettings(){
   $("setCompany").value = companyData.company_name || "";
+  $("setDesc").value = companyData.business_description || "";
   const p = $("logoPreview");
   if(companyData.logo_base64){ p.src = companyData.logo_base64; p.classList.remove("hidden"); }
   else p.classList.add("hidden");
@@ -458,6 +514,7 @@ function logoChanged(input){
 async function saveSettings(){
   try{
     companyData.company_name = $("setCompany").value;
+    companyData.business_description = $("setDesc").value;
     await api("/api/company", {method:"POST", body:JSON.stringify(companyData)});
     toast(t().saved);
     closeSettings();
