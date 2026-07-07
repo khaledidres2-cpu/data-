@@ -91,6 +91,19 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
 .toast.show{opacity:1}
 .toast.err{background:var(--danger)}
 
+/* ---------- إعدادات الشركة ---------- */
+.overlay{position:fixed;inset:0;background:rgba(20,35,30,.45);display:flex;align-items:center;justify-content:center;z-index:50;padding:16px}
+.modal{background:var(--card);border-radius:var(--radius);padding:24px;max-width:420px;width:100%}
+.modal h3{font-size:18px;font-weight:900;margin-bottom:16px}
+.logo-preview{max-height:60px;max-width:140px;display:block;margin-top:8px;border:1px solid var(--line);border-radius:8px;padding:4px}
+.modal-actions{display:flex;gap:8px;margin-top:18px}
+.btn-ghost{flex:1;background:#EEF3F1;color:var(--ink);padding:12px;border-radius:10px;font-size:15px;font-weight:600}
+.modal-actions .btn-main{flex:1;width:auto}
+.btn-pdf{background:var(--primary);color:#fff;border-radius:10px;padding:9px 18px;font-size:14px;font-weight:700}
+.btn-pdf:hover{background:var(--primary-dark)}
+.btn-pdf:disabled{opacity:.6;cursor:wait}
+.btn-mini{background:#EEF3F1;color:var(--ink);border-radius:8px;padding:8px 12px;font-size:13px;font-weight:600;text-decoration:none;display:inline-flex;align-items:center}
+.btn-mini:hover{background:#E2EAE6}
 @media (max-width:560px){
   .search-hero h2{font-size:21px}
   .lead{flex-direction:column}
@@ -105,6 +118,7 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
   <div class="logo" id="logo">Lead<span>Finder</span></div>
   <div class="hdr-actions">
     <button class="pill" id="langBtn" onclick="toggleLang()">English</button>
+    <button class="pill hidden" id="settingsBtn" onclick="openSettings()"></button>
     <button class="pill hidden" id="logoutBtn" onclick="logout()"></button>
   </div>
 </header>
@@ -149,11 +163,30 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
       <button class="tab" id="tabHistory" onclick="showTab('history')"></button>
     </div>
     <div id="panelResults">
-      <div class="count-bar hidden" id="countBar"><span id="countTxt"></span></div>
+      <div class="count-bar hidden" id="countBar"><span id="countTxt"></span><button class="btn-pdf" id="pdfBtn" onclick="downloadPDF()"></button></div>
       <div id="resultsList"><div class="status" id="emptyResults"></div></div>
     </div>
     <div id="panelHistory" class="hidden">
       <div id="historyList"><div class="status" id="emptyHistory"></div></div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay hidden" id="settingsOverlay">
+  <div class="modal">
+    <h3 id="setTitle"></h3>
+    <div class="field">
+      <label id="setLblName"></label>
+      <input id="setCompany" type="text">
+    </div>
+    <div class="field">
+      <label id="setLblLogo"></label>
+      <input id="setLogo" type="file" accept="image/*" onchange="logoChanged(this)">
+      <img class="logo-preview hidden" id="logoPreview">
+    </div>
+    <div class="modal-actions">
+      <button class="btn-ghost" id="setCancel" onclick="closeSettings()"></button>
+      <button class="btn-main" id="setSave" onclick="saveSettings()"></button>
     </div>
   </div>
 </div>
@@ -181,7 +214,12 @@ const T = {
     resultsFor:(n,q)=>`${n} عميل محتمل لبحث: «${q}»`,
     whatsapp:"واتساب", website:"الموقع", maps:"خرائط", noPhone:"لا يوجد رقم منشور",
     reviews:"تقييم", loading:"جارٍ التحميل…",
-    errNetwork:"تعذر الاتصال بالخادم", done:(n)=>`تم العثور على ${n} عميل محتمل`
+    errNetwork:"تعذر الاتصال بالخادم", done:(n)=>`تم العثور على ${n} عميل محتمل`,
+    settings:"إعدادات الشركة", setTitle:"إعدادات الشركة",
+    setName:"اسم الشركة (يظهر في ملف PDF)", setLogo:"شعار الشركة (يظهر في ملف PDF)",
+    save:"حفظ", cancel:"إلغاء", saved:"تم الحفظ",
+    pdf:"⬇ تحميل PDF", pdfWorking:"جارٍ التوليد…", pdfHint:"أضف اسم شركتك وشعارك من «إعدادات الشركة» ليظهرا في الملف",
+    call:"اتصال", copy:"نسخ", copied:"تم نسخ الرقم", logoTooBig:"الصورة كبيرة — اختر صورة أقل من 1.5MB"
   },
   en: {
     langBtn:"عربي", logout:"Log out",
@@ -201,7 +239,12 @@ const T = {
     resultsFor:(n,q)=>`${n} leads for: "${q}"`,
     whatsapp:"WhatsApp", website:"Website", maps:"Maps", noPhone:"No published phone",
     reviews:"reviews", loading:"Loading…",
-    errNetwork:"Could not reach the server", done:(n)=>`Found ${n} leads`
+    errNetwork:"Could not reach the server", done:(n)=>`Found ${n} leads`,
+    settings:"Company settings", setTitle:"Company settings",
+    setName:"Company name (shown in PDF)", setLogo:"Company logo (shown in PDF)",
+    save:"Save", cancel:"Cancel", saved:"Saved",
+    pdf:"⬇ Download PDF", pdfWorking:"Generating…", pdfHint:"Add your company name and logo in Company settings to show them in the file",
+    call:"Call", copy:"Copy", copied:"Number copied", logoTooBig:"Image too large — pick one under 1.5MB"
   }
 };
 
@@ -218,6 +261,13 @@ function applyLang(){
   document.documentElement.dir = lang === "ar" ? "rtl" : "ltr";
   $("langBtn").textContent = t().langBtn;
   $("logoutBtn").textContent = t().logout;
+  $("settingsBtn").textContent = "⚙ " + t().settings;
+  $("setTitle").textContent = t().setTitle;
+  $("setLblName").textContent = t().setName;
+  $("setLblLogo").textContent = t().setLogo;
+  $("setCancel").textContent = t().cancel;
+  $("setSave").textContent = t().save;
+  $("pdfBtn").textContent = t().pdf;
   $("lblCompany").textContent = t().company;
   $("lblEmail").textContent = t().email;
   $("lblPassword").textContent = t().password;
@@ -270,6 +320,8 @@ function showApp(){
   $("authScreen").classList.add("hidden");
   $("appScreen").classList.remove("hidden");
   $("logoutBtn").classList.remove("hidden");
+  $("settingsBtn").classList.remove("hidden");
+  loadCompany();
   loadHistory();
 }
 function showTab(name){
@@ -304,6 +356,7 @@ async function runSearch(){
   $("countBar").classList.add("hidden");
   try{
     const d = await api("/api/search", {method:"POST", body:JSON.stringify({query:q, language:lang})});
+    lastSearchId = d.search_id;
     renderLeads(d.leads, q);
     toast(t().done(d.count));
   }catch(e){
@@ -330,6 +383,10 @@ function renderLeads(leads, query){
         <div class="lead-meta">
           ${l.rating ? `<span class="rating">★ ${l.rating}</span><span>(${l.reviews_count||0} ${t().reviews})</span>` : ""}
           ${l.phone ? `<span class="lead-phone">${esc(l.phone)}</span>` : ""}
+        </div>
+        <div class="lead-meta" style="margin-top:8px">
+          ${l.phone ? `<a class="btn-mini" href="tel:${esc(l.phone).replace(/\s/g,'')}">📞 ${t().call}</a>
+          <button class="btn-mini" onclick="copyPhone('${esc(l.phone)}')">📋 ${t().copy}</button>` : ""}
         </div>
       </div>
       <div class="lead-actions">
@@ -366,8 +423,66 @@ async function openSearch(id, query){
   $("resultsList").innerHTML = `<div class="status">${t().loading}</div>`;
   try{
     const leads = await api(`/api/searches/${id}/leads`);
+    lastSearchId = id;
     renderLeads(leads, query);
   }catch(e){ toast(e.message, true); }
+}
+
+/* ---------------- الشركة وPDF والنسخ ---------------- */
+let lastSearchId = null;
+let companyData = {company_name:"", logo_base64:""};
+
+async function loadCompany(){
+  try{ companyData = await api("/api/company"); }catch(e){}
+}
+function openSettings(){
+  $("setCompany").value = companyData.company_name || "";
+  const p = $("logoPreview");
+  if(companyData.logo_base64){ p.src = companyData.logo_base64; p.classList.remove("hidden"); }
+  else p.classList.add("hidden");
+  $("settingsOverlay").classList.remove("hidden");
+}
+function closeSettings(){ $("settingsOverlay").classList.add("hidden"); }
+function logoChanged(input){
+  const f = input.files[0];
+  if(!f) return;
+  if(f.size > 1_500_000){ toast(t().logoTooBig, true); input.value=""; return; }
+  const r = new FileReader();
+  r.onload = () => {
+    companyData.logo_base64 = r.result;
+    $("logoPreview").src = r.result;
+    $("logoPreview").classList.remove("hidden");
+  };
+  r.readAsDataURL(f);
+}
+async function saveSettings(){
+  try{
+    companyData.company_name = $("setCompany").value;
+    await api("/api/company", {method:"POST", body:JSON.stringify(companyData)});
+    toast(t().saved);
+    closeSettings();
+  }catch(e){ toast(e.message, true); }
+}
+async function downloadPDF(){
+  if(!lastSearchId) return;
+  const btn = $("pdfBtn");
+  btn.disabled = true; btn.textContent = t().pdfWorking;
+  try{
+    if(!companyData.company_name && !companyData.logo_base64) toast(t().pdfHint);
+    const r = await fetch(`/api/searches/${lastSearchId}/pdf?lang=${lang}`,
+      {headers:{Authorization:"Bearer "+token}});
+    if(!r.ok){ const d = await r.json().catch(()=>({})); throw new Error(d.detail || t().errNetwork); }
+    const blob = await r.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `leads-${lastSearchId}.pdf`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = t().pdf;
+}
+function copyPhone(p){
+  navigator.clipboard.writeText(p).then(()=>toast(t().copied)).catch(()=>{});
 }
 
 /* ---------------- إشعارات ---------------- */
