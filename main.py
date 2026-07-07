@@ -304,7 +304,8 @@ def search_leads(search_id: int, user_id: int = Depends(get_current_user)):
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT * FROM leads WHERE user_id=%s AND search_id=%s ORDER BY rating DESC NULLS LAST",
+            "SELECT * FROM leads WHERE user_id=%s AND search_id=%s "
+            "ORDER BY ai_score DESC NULLS LAST, rating DESC NULLS LAST",
             (user_id, search_id),
         )
         return cur.fetchall()
@@ -415,7 +416,8 @@ def search_pdf(search_id: int, lang: str = "ar", user_id: int = Depends(get_curr
         if not s:
             raise HTTPException(404, "البحث غير موجود")
         cur.execute(
-            "SELECT * FROM leads WHERE user_id=%s AND search_id=%s ORDER BY rating DESC NULLS LAST",
+            "SELECT * FROM leads WHERE user_id=%s AND search_id=%s "
+            "ORDER BY ai_score DESC NULLS LAST, rating DESC NULLS LAST",
             (user_id, search_id),
         )
         leads = cur.fetchall()
@@ -508,8 +510,8 @@ def analyze_search(search_id: int, data: AnalyzeIn, user_id: int = Depends(get_c
         if not s:
             raise HTTPException(404, "البحث غير موجود")
         cur.execute(
-            "SELECT id, place_id, name, address, rating, reviews_count, website "
-            "FROM leads WHERE user_id=%s AND search_id=%s",
+            "SELECT id, place_id, name, address, rating, reviews_count, website, ai_score "
+            "FROM leads WHERE user_id=%s AND search_id=%s ORDER BY id",
             (user_id, search_id),
         )
         leads = cur.fetchall()
@@ -520,19 +522,24 @@ def analyze_search(search_id: int, data: AnalyzeIn, user_id: int = Depends(get_c
     if not leads:
         raise HTTPException(400, "لا توجد نتائج لتحليلها")
 
+    total = len(leads)
+    # نحلل فقط غير المحلل — طلب واحد = 10 شركات (سريع وآمن من انقطاع الاتصال)
+    pending = [l for l in leads if l.get("ai_score") is None][:10]
+    if not pending:
+        return {"remaining": 0, "total": total}
+
     lang_name = "العربية" if data.language == "ar" else "English"
 
-    def analyze_batch(batch):
-        leads_json = json.dumps([{
-            "place_id": l["place_id"],
-            "name": l["name"],
-            "address": l["address"],
-            "rating": l["rating"],
-            "reviews": l["reviews_count"],
-            "has_website": bool(l["website"]),
-        } for l in batch], ensure_ascii=False)
+    leads_json = json.dumps([{
+        "place_id": l["place_id"],
+        "name": l["name"],
+        "address": l["address"],
+        "rating": l["rating"],
+        "reviews": l["reviews_count"],
+        "has_website": bool(l["website"]),
+    } for l in pending], ensure_ascii=False)
 
-        prompt = f"""أنت محلل مبيعات خبير. مستخدم اسمه/شركته: «{user['company_name'] or 'غير محدد'}».
+    prompt = f"""أنت محلل مبيعات خبير. مستخدم اسمه/شركته: «{user['company_name'] or 'غير محدد'}».
 وصف نشاطه وما يبيعه: «{desc}»
 بحث عن عملاء محتملين بكلمات: «{s['query']}» وحصل على قائمة الشركات أدناه.
 
@@ -547,6 +554,7 @@ def analyze_search(search_id: int, data: AnalyzeIn, user_id: int = Depends(get_c
 أعد فقط JSON بهذا الشكل بدون أي نص قبله أو بعده وبدون علامات تنسيق:
 [{{"place_id": "...", "score": 8, "reason": "...", "message": "..."}}]"""
 
+    try:
         resp = httpx.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -556,35 +564,25 @@ def analyze_search(search_id: int, data: AnalyzeIn, user_id: int = Depends(get_c
             },
             json={
                 "model": "claude-haiku-4-5",
-                "max_tokens": 8000,
+                "max_tokens": 4000,
                 "messages": [{"role": "user", "content": prompt}],
             },
-            timeout=180,
+            timeout=90,
         )
-        if resp.status_code != 200:
-            raise HTTPException(502, f"خطأ من خدمة التحليل: {resp.text[:300]}")
-        text = "".join(b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text")
-        # نستخرج مصفوفة JSON حتى لو أحاط بها نص أو علامات تنسيق
-        m = re.search(r"\[[\s\S]*\]", re.sub(r"```json|```", "", text))
-        if not m:
-            return []
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            return []
-
-    # نحلل على دفعات من 20 شركة لضمان اكتمال كل رد
-    items = []
-    try:
-        for i in range(0, len(leads), 20):
-            items.extend(analyze_batch(leads[i:i + 20]))
-    except HTTPException:
-        raise
     except Exception:
-        raise HTTPException(502, "تعذر الاتصال بخدمة التحليل")
+        raise HTTPException(502, "تعذر الاتصال بخدمة التحليل — أعد الضغط على الزر للاستئناف")
 
+    if resp.status_code != 200:
+        raise HTTPException(502, f"خطأ من خدمة التحليل: {resp.text[:300]}")
+
+    text = "".join(b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text")
+    m = re.search(r"\[[\s\S]*\]", re.sub(r"```json|```", "", text))
+    try:
+        items = json.loads(m.group(0)) if m else []
+    except Exception:
+        items = []
     if not items:
-        raise HTTPException(502, "تعذر قراءة نتيجة التحليل — أعد المحاولة")
+        raise HTTPException(502, "تعذر قراءة نتيجة التحليل — أعد الضغط على الزر للاستئناف")
 
     with get_db() as conn:
         cur = conn.cursor()
@@ -596,10 +594,9 @@ def analyze_search(search_id: int, data: AnalyzeIn, user_id: int = Depends(get_c
                  user_id, search_id, it.get("place_id", "")),
             )
         cur.execute(
-            "SELECT * FROM leads WHERE user_id=%s AND search_id=%s "
-            "ORDER BY ai_score DESC NULLS LAST, rating DESC NULLS LAST",
+            "SELECT COUNT(*) AS c FROM leads WHERE user_id=%s AND search_id=%s AND ai_score IS NULL",
             (user_id, search_id),
         )
-        result = cur.fetchall()
+        remaining = cur.fetchone()["c"]
 
-    return {"count": len(result), "leads": result}
+    return {"remaining": remaining, "total": total}
