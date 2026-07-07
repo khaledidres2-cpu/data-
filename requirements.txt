@@ -5,3 +5,4 @@ httpx==0.28.1
 PyJWT==2.10.1
 pydantic==2.10.4
 weasyprint==62.3
+pydyf==0.10.0
