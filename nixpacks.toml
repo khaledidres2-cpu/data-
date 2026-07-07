@@ -1,2 +1,2 @@
 [phases.setup]
-nixPkgs = ["...", "pango", "harfbuzz", "gdk-pixbuf", "fontconfig", "glib"]
+aptPkgs = ["libpango-1.0-0", "libpangoft2-1.0-0", "libharfbuzz0b", "libharfbuzz-subset0", "shared-mime-info"]
