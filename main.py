@@ -90,6 +90,10 @@ def init_db():
         ALTER TABLE leads ADD COLUMN IF NOT EXISTS ai_score REAL;
         ALTER TABLE leads ADD COLUMN IF NOT EXISTS ai_reason TEXT DEFAULT '';
         ALTER TABLE leads ADD COLUMN IF NOT EXISTS ai_message TEXT DEFAULT '';
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'new';
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS status_updated_at TIMESTAMPTZ;
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS contacted_at TIMESTAMPTZ;
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS deal_value NUMERIC;
         """)
 
 
@@ -283,8 +287,14 @@ def search(data: SearchIn, user_id: int = Depends(get_current_user)):
             results.append(lead)
 
         cur.execute("UPDATE searches SET results_count=%s WHERE id=%s", (len(results), search_id))
+        cur.execute(
+            "SELECT * FROM leads WHERE user_id=%s AND search_id=%s "
+            "ORDER BY rating DESC NULLS LAST",
+            (user_id, search_id),
+        )
+        rows = cur.fetchall()
 
-    return {"search_id": search_id, "count": len(results), "leads": results}
+    return {"search_id": search_id, "count": len(rows), "leads": rows}
 
 # ---------------- السجل ----------------
 @app.get("/api/searches")
@@ -605,36 +615,52 @@ def analyze_search(search_id: int, data: AnalyzeIn, user_id: int = Depends(get_c
     return {"remaining": remaining, "total": total}
 
 
-# ================== تشخيص مؤقت (يُحذف لاحقاً) ==================
-@app.get("/api/diag")
-def diag():
-    out = {
-        "anthropic_key_set": bool(ANTHROPIC_API_KEY),
-        "key_prefix": (ANTHROPIC_API_KEY[:14] + "...") if ANTHROPIC_API_KEY else "",
-        "google_key_set": bool(GOOGLE_PLACES_API_KEY),
-    }
-    if not ANTHROPIC_API_KEY:
-        out["verdict"] = "المفتاح غير موجود — أضف ANTHROPIC_API_KEY في متغيرات خدمة data- في Railway"
-        return out
-    try:
-        r = httpx.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-haiku-4-5",
-                "max_tokens": 16,
-                "messages": [{"role": "user", "content": "قل: تم"}],
-            },
-            timeout=30,
+# ================== المرحلة 5: خط سير العميل ==================
+ALLOWED_STATUSES = {"new", "contacted", "replied", "interested", "meeting", "deal", "lost"}
+
+
+class StatusIn(BaseModel):
+    status: str
+    deal_value: float | None = None
+
+
+@app.post("/api/leads/{lead_id}/status")
+def set_lead_status(lead_id: int, data: StatusIn, user_id: int = Depends(get_current_user)):
+    if data.status not in ALLOWED_STATUSES:
+        raise HTTPException(400, "حالة غير معروفة")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE leads SET
+                 status = %s,
+                 status_updated_at = NOW(),
+                 contacted_at = CASE WHEN contacted_at IS NULL AND %s <> 'new'
+                                     THEN NOW() ELSE contacted_at END,
+                 deal_value = COALESCE(%s, deal_value)
+               WHERE id = %s AND user_id = %s RETURNING id""",
+            (data.status, data.status, data.deal_value, lead_id, user_id),
         )
-        out["status_code"] = r.status_code
-        out["response"] = r.text[:400]
-        out["verdict"] = "الاتصال يعمل ✅" if r.status_code == 200 else "الاتصال يصل لكن الخدمة ترفض — اقرأ response"
-    except Exception as exc:
-        out["error"] = repr(exc)[:400]
-        out["verdict"] = "فشل الاتصال الشبكي من الخادم إلى Anthropic — اقرأ error"
-    return out
+        if not cur.fetchone():
+            raise HTTPException(404, "العميل غير موجود")
+    return {"ok": True}
+
+
+@app.get("/api/pipeline")
+def pipeline(user_id: int = Depends(get_current_user)):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COALESCE(status,'new') AS status, COUNT(*) AS c, "
+            "COALESCE(SUM(deal_value),0) AS v "
+            "FROM leads WHERE user_id=%s GROUP BY COALESCE(status,'new')",
+            (user_id,),
+        )
+        stats = {r["status"]: {"count": r["c"], "value": float(r["v"])} for r in cur.fetchall()}
+        cur.execute(
+            "SELECT * FROM leads WHERE user_id=%s AND COALESCE(status,'new') <> 'new' "
+            "ORDER BY status_updated_at DESC NULLS LAST LIMIT 500",
+            (user_id,),
+        )
+        rows = cur.fetchall()
+    deal_total = stats.get("deal", {}).get("value", 0)
+    return {"stats": stats, "deal_total": deal_total, "leads": rows}
