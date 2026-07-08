@@ -130,6 +130,16 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
 .btn-fu{background:#FEF3C7;color:#B45309}
 .btn-fu:hover{background:#FDE68A}
 #followBox{margin-bottom:16px}
+.usage-bar{margin-top:14px;font-size:13.5px;color:var(--muted)}
+.link-btn{background:none;border:none;color:var(--primary);font-weight:700;cursor:pointer;font-size:13px;text-decoration:underline;font-family:inherit;padding:0 4px}
+.plans-modal{max-width:720px}
+#plansGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:6px}
+.plan-card{border:1.5px solid var(--line);border-radius:12px;padding:18px 14px;text-align:center}
+.plan-card.current{border-color:var(--primary);background:#F0F7F4}
+.plan-name{font-weight:900;font-size:16px;margin-bottom:6px}
+.plan-price{font-size:22px;font-weight:900;color:var(--primary)}
+.plan-feat{color:var(--muted);font-size:13px;margin:10px 0 14px;line-height:1.8}
+.plan-cur{color:var(--primary);font-weight:700;font-size:13.5px;padding:10px 0}
 .btn-pdf{background:var(--primary);color:#fff;border-radius:10px;padding:9px 18px;font-size:14px;font-weight:700}
 .btn-pdf:hover{background:var(--primary-dark)}
 .btn-pdf:disabled{opacity:.6;cursor:wait}
@@ -149,6 +159,7 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
   <div class="logo" id="logo">Lead<span>Finder</span></div>
   <div class="hdr-actions">
     <button class="pill" id="langBtn" onclick="toggleLang()">English</button>
+    <button class="pill hidden" id="adminBtn" onclick="openAdmin()"></button>
     <button class="pill hidden" id="settingsBtn" onclick="openSettings()"></button>
     <button class="pill hidden" id="logoutBtn" onclick="logout()"></button>
   </div>
@@ -189,6 +200,7 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
       <label><input type="checkbox" id="strictCity" checked> <span id="strictLbl"></span></label>
     </div>
     <div class="chips" id="chips"></div>
+    <div class="usage-bar" id="usageBar"></div>
   </div>
 
   <div class="container">
@@ -232,6 +244,33 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
     <div class="modal-actions">
       <button class="btn-ghost" id="setCancel" onclick="closeSettings()"></button>
       <button class="btn-main" id="setSave" onclick="saveSettings()"></button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay hidden" id="plansOverlay">
+  <div class="modal plans-modal">
+    <h3 id="plansTitle"></h3>
+    <div id="plansGrid"></div>
+    <div class="modal-actions"><button class="btn-ghost" id="plansClose" onclick="closePlans()"></button></div>
+  </div>
+</div>
+
+<div class="overlay hidden" id="adminOverlay">
+  <div class="modal">
+    <h3 id="admTitle"></h3>
+    <div class="field"><label id="admLblEmail"></label><input id="admEmail" type="email" dir="ltr"></div>
+    <div class="field"><label id="admLblPlan"></label>
+      <select id="admPlan" class="status-sel" style="width:100%">
+        <option value="basic">basic — 99</option>
+        <option value="pro">pro — 199</option>
+        <option value="free">free</option>
+      </select>
+    </div>
+    <div class="field"><label id="admLblMonths"></label><input id="admMonths" type="number" value="1" min="1" max="24"></div>
+    <div class="modal-actions">
+      <button class="btn-ghost" id="admCancel" onclick="$('adminOverlay').classList.add('hidden')"></button>
+      <button class="btn-main" id="admGo" onclick="adminActivate()"></button>
     </div>
   </div>
 </div>
@@ -280,7 +319,17 @@ const T = {
     needFollowup:(n)=>`⏰ يحتاجون متابعة (${n})`,
     waitDays:(d)=> d===1?"مر يوم بلا رد":d===2?"مر يومان بلا رد":d<=10?`مرت ${d} أيام بلا رد`:`مر ${d} يوماً بلا رد`,
     genFollowup:"رسالة متابعة", fuWriting:"جارٍ الكتابة…",
-    fuBumped:"تم — سيعود للتذكير بعد 3 أيام إن لم يرد"
+    fuBumped:"تم — سيعود للتذكير بعد 3 أيام إن لم يرد",
+    planWord:"الخطة", planNames:{free:"المجانية", basic:"الأساسية", pro:"الاحترافية"},
+    usageSearches:"بحث", usageAnalyses:"تحليل ذكي", plansBtn:"الترقية والخطط ↗",
+    plansTitle:"خطط LeadFinder", perMonth:"درهم/شهر", freePrice:"مجاناً",
+    currentPlan:"✓ خطتك الحالية", activateWa:"تفعيل عبر واتساب", contactUs:"تواصل معنا للتفعيل",
+    planFeat:(s,a)=>`${s} عملية بحث شهرياً<br>${a} تحليل ذكي شهرياً<br>PDF + خط سير + متابعات`,
+    close:"إغلاق",
+    waActivateMsg:(plan,email)=>`مرحباً، أرغب بتفعيل الخطة ${plan} لحسابي (${email}) في LeadFinder`,
+    admBtn:"⚡ تفعيل مشترك", admTitle:"تفعيل اشتراك يدوي",
+    admEmail:"بريد المشترك", admPlan:"الخطة", admMonths:"عدد الأشهر",
+    activate:"تفعيل", activated:"تم التفعيل حتى"
   },
   en: {
     langBtn:"عربي", logout:"Log out",
@@ -321,7 +370,17 @@ const T = {
     needFollowup:(n)=>`⏰ Need follow-up (${n})`,
     waitDays:(d)=>`${d} day${d>1?"s":""} with no reply`,
     genFollowup:"Follow-up message", fuWriting:"Writing…",
-    fuBumped:"Done — will remind again in 3 days if no reply"
+    fuBumped:"Done — will remind again in 3 days if no reply",
+    planWord:"Plan", planNames:{free:"Free", basic:"Basic", pro:"Pro"},
+    usageSearches:"searches", usageAnalyses:"AI analyses", plansBtn:"Plans & upgrade ↗",
+    plansTitle:"LeadFinder Plans", perMonth:"AED/mo", freePrice:"Free",
+    currentPlan:"✓ Your current plan", activateWa:"Activate via WhatsApp", contactUs:"Contact us to activate",
+    planFeat:(s,a)=>`${s} searches / month<br>${a} AI analyses / month<br>PDF + Pipeline + Follow-ups`,
+    close:"Close",
+    waActivateMsg:(plan,email)=>`Hi, I'd like to activate the ${plan} plan for my LeadFinder account (${email})`,
+    admBtn:"⚡ Activate user", admTitle:"Manual subscription activation",
+    admEmail:"Subscriber email", admPlan:"Plan", admMonths:"Months",
+    activate:"Activate", activated:"Activated until"
   }
 };
 
@@ -349,6 +408,16 @@ function applyLang(){
   $("setLblDesc").textContent = t().setDesc;
   $("setDescHint").textContent = t().setDescHint;
   $("aiBtn").textContent = t().ai;
+  $("plansTitle").textContent = t().plansTitle;
+  $("plansClose").textContent = t().close;
+  $("adminBtn").textContent = t().admBtn;
+  $("admTitle").textContent = t().admTitle;
+  $("admLblEmail").textContent = t().admEmail;
+  $("admLblPlan").textContent = t().admPlan;
+  $("admLblMonths").textContent = t().admMonths;
+  $("admCancel").textContent = t().cancel;
+  $("admGo").textContent = t().activate;
+  renderUsage();
   $("lblCompany").textContent = t().company;
   $("lblEmail").textContent = t().email;
   $("lblPassword").textContent = t().password;
@@ -404,6 +473,7 @@ function showApp(){
   $("logoutBtn").classList.remove("hidden");
   $("settingsBtn").classList.remove("hidden");
   loadCompany();
+  loadUsage();
   loadHistory();
 }
 function showTab(name){
@@ -426,7 +496,11 @@ async function api(path, opts={}){
   }});
   if(r.status === 401){ logout(); return; }
   const d = await r.json();
-  if(!r.ok) throw new Error(d.detail || t().errNetwork);
+  if(!r.ok){
+    const err = new Error(d.detail || t().errNetwork);
+    err.status = r.status;
+    throw err;
+  }
   return d;
 }
 
@@ -447,8 +521,10 @@ async function runSearch(){
   }catch(e){
     $("resultsList").innerHTML = `<div class="status">${e.message}</div>`;
     toast(e.message, true);
+    if(e.status === 402) openPlans();
   }
   btn.disabled = false; btn.textContent = t().searchBtn;
+  loadUsage();
 }
 
 function esc(s){ return (s||"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
@@ -642,8 +718,12 @@ async function runAnalyze(){
     const leads = await api(`/api/searches/${lastSearchId}/leads`);
     renderLeads(leads, lastQuery);
     toast(t().aiDone);
-  }catch(e){ toast(e.message, true); }
+  }catch(e){
+    toast(e.message, true);
+    if(e.status === 402) openPlans();
+  }
   btn.disabled = false; btn.textContent = t().ai;
+  loadUsage();
 }
 function copyMsg(btn){
   navigator.clipboard.writeText(btn.dataset.msg).then(()=>toast(t().msgCopied)).catch(()=>{});
@@ -703,6 +783,62 @@ async function downloadPDF(){
 }
 function copyPhone(p){
   navigator.clipboard.writeText(p).then(()=>toast(t().copied)).catch(()=>{});
+}
+
+/* ---------------- الاستخدام والخطط ---------------- */
+let usageData = null;
+
+async function loadUsage(){
+  try{
+    usageData = await api("/api/usage");
+    renderUsage();
+    if(usageData.is_admin) $("adminBtn").classList.remove("hidden");
+  }catch(e){}
+}
+
+function renderUsage(){
+  if(!usageData){ $("usageBar").innerHTML = ""; return; }
+  const u = usageData;
+  $("usageBar").innerHTML =
+    `${t().planWord}: <b>${t().planNames[u.plan]}</b> · ` +
+    `${t().usageSearches} ${u.searches_used}/${u.searches_limit} · ` +
+    `${t().usageAnalyses} ${u.analyses_used}/${u.analyses_limit}` +
+    `<button class="link-btn" onclick="openPlans()">${t().plansBtn}</button>`;
+}
+
+function openPlans(){
+  if(!usageData) return;
+  const P = usageData.plans, cur = usageData.plan;
+  $("plansGrid").innerHTML = ["free","basic","pro"].map(k=>{
+    const p = P[k], isCur = k===cur;
+    const waMsg = encodeURIComponent(t().waActivateMsg(t().planNames[k], usageData.email||""));
+    let btn = "";
+    if(isCur) btn = `<div class="plan-cur">${t().currentPlan}</div>`;
+    else if(k !== "free")
+      btn = usageData.support_whatsapp
+        ? `<a class="btn-wa" style="justify-content:center;width:100%" href="https://wa.me/${usageData.support_whatsapp}?text=${waMsg}" target="_blank" rel="noopener">💬 ${t().activateWa}</a>`
+        : `<div class="plan-cur">${t().contactUs}</div>`;
+    return `<div class="plan-card ${isCur?"current":""}">
+      <div class="plan-name">${t().planNames[k]}</div>
+      <div class="plan-price">${p.price ? p.price + " " + t().perMonth : t().freePrice}</div>
+      <div class="plan-feat">${t().planFeat(p.searches, p.analyses)}</div>
+      ${btn}</div>`;
+  }).join("");
+  $("plansOverlay").classList.remove("hidden");
+}
+function closePlans(){ $("plansOverlay").classList.add("hidden"); }
+
+function openAdmin(){ $("adminOverlay").classList.remove("hidden"); }
+async function adminActivate(){
+  try{
+    const d = await api("/api/admin/activate", {method:"POST", body:JSON.stringify({
+      email: $("admEmail").value,
+      plan: $("admPlan").value,
+      months: parseInt($("admMonths").value) || 1
+    })});
+    toast(t().activated + " " + (d.plan_expires_at ? new Date(d.plan_expires_at).toLocaleDateString(lang==="ar"?"ar-AE":"en-GB") : "∞"));
+    $("adminOverlay").classList.add("hidden");
+  }catch(e){ toast(e.message, true); }
 }
 
 /* ---------------- إشعارات ---------------- */
