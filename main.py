@@ -37,6 +37,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------- الخطط والحصص ----------------
+PLANS = {
+    "free":  {"searches": 3,   "analyses": 1,   "price": 0},
+    "basic": {"searches": 30,  "analyses": 30,  "price": 99},
+    "pro":   {"searches": 100, "analyses": 100, "price": 199},
+}
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()
+SUPPORT_WHATSAPP = re.sub(r"\D", "", os.environ.get("SUPPORT_WHATSAPP", ""))
+
+
+def effective_plan(user) -> str:
+    plan = user.get("plan") or "free"
+    if plan not in PLANS:
+        return "free"
+    if plan != "free":
+        exp = user.get("plan_expires_at")
+        if not exp or exp < datetime.datetime.now(exp.tzinfo):
+            return "free"  # انتهى الاشتراك
+    return plan
+
+
+def get_usage(cur, user_id: int):
+    cur.execute(
+        "SELECT COUNT(*) AS c FROM searches WHERE user_id=%s "
+        "AND created_at >= date_trunc('month', NOW())", (user_id,))
+    s = cur.fetchone()["c"]
+    cur.execute(
+        "SELECT COUNT(*) AS c FROM searches WHERE user_id=%s "
+        "AND analyzed_at >= date_trunc('month', NOW())", (user_id,))
+    a = cur.fetchone()["c"]
+    return s, a
+
+
 # ---------------- قاعدة البيانات ----------------
 @contextmanager
 def get_db():
@@ -87,6 +120,9 @@ def init_db():
         );
         ALTER TABLE users ADD COLUMN IF NOT EXISTS logo_base64 TEXT DEFAULT '';
         ALTER TABLE users ADD COLUMN IF NOT EXISTS business_description TEXT DEFAULT '';
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS plan TEXT DEFAULT 'free';
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_expires_at TIMESTAMPTZ;
+        ALTER TABLE searches ADD COLUMN IF NOT EXISTS analyzed_at TIMESTAMPTZ;
         ALTER TABLE leads ADD COLUMN IF NOT EXISTS ai_score REAL;
         ALTER TABLE leads ADD COLUMN IF NOT EXISTS ai_reason TEXT DEFAULT '';
         ALTER TABLE leads ADD COLUMN IF NOT EXISTS ai_message TEXT DEFAULT '';
@@ -207,6 +243,16 @@ def search(data: SearchIn, user_id: int = Depends(get_current_user)):
         raise HTTPException(400, "اكتب القطاع والمدينة أولاً")
     if not GOOGLE_PLACES_API_KEY:
         raise HTTPException(500, "GOOGLE_PLACES_API_KEY غير مضبوط في Railway")
+
+    # فرض حد البحث الشهري حسب الخطة
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT plan, plan_expires_at FROM users WHERE id=%s", (user_id,))
+        u = cur.fetchone()
+        s_used, _ = get_usage(cur, user_id)
+    plan = effective_plan(u)
+    if s_used >= PLANS[plan]["searches"]:
+        raise HTTPException(402, "استنفدت حصة البحث لهذا الشهر — رقِّ خطتك لمواصلة توليد العملاء")
 
     headers = {
         "Content-Type": "application/json",
@@ -518,9 +564,11 @@ def analyze_search(search_id: int, data: AnalyzeIn, user_id: int = Depends(get_c
 
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT company_name, business_description FROM users WHERE id=%s", (user_id,))
+        cur.execute(
+            "SELECT company_name, business_description, plan, plan_expires_at "
+            "FROM users WHERE id=%s", (user_id,))
         user = cur.fetchone()
-        cur.execute("SELECT query FROM searches WHERE id=%s AND user_id=%s", (search_id, user_id))
+        cur.execute("SELECT query, analyzed_at FROM searches WHERE id=%s AND user_id=%s", (search_id, user_id))
         s = cur.fetchone()
         if not s:
             raise HTTPException(404, "البحث غير موجود")
@@ -542,6 +590,14 @@ def analyze_search(search_id: int, data: AnalyzeIn, user_id: int = Depends(get_c
     pending = [l for l in leads if l.get("ai_score") is None][:10]
     if not pending:
         return {"remaining": 0, "total": total}
+
+    # فرض حد التحليل الشهري (يُحتسب مرة واحدة لكل بحث مهما بلغت دفعاته)
+    if not s.get("analyzed_at"):
+        with get_db() as conn:
+            cur = conn.cursor()
+            _, a_used = get_usage(cur, user_id)
+        if a_used >= PLANS[effective_plan(user)]["analyses"]:
+            raise HTTPException(402, "استنفدت حصة التحليل الذكي لهذا الشهر — رقِّ خطتك للمواصلة")
 
     lang_name = "العربية" if data.language == "ar" else "English"
 
@@ -608,6 +664,10 @@ def analyze_search(search_id: int, data: AnalyzeIn, user_id: int = Depends(get_c
                 (it.get("score"), it.get("reason", ""), it.get("message", ""),
                  user_id, search_id, it.get("place_id", "")),
             )
+        cur.execute(
+            "UPDATE searches SET analyzed_at=COALESCE(analyzed_at, NOW()) WHERE id=%s AND user_id=%s",
+            (search_id, user_id),
+        )
         cur.execute(
             "SELECT COUNT(*) AS c FROM leads WHERE user_id=%s AND search_id=%s AND ai_score IS NULL",
             (user_id, search_id),
@@ -749,3 +809,56 @@ def gen_followup(lead_id: int, data: FollowupIn, user_id: int = Depends(get_curr
             (text, lead_id, user_id),
         )
     return {"message": text}
+
+
+# ================== الاستخدام والخطط ==================
+@app.get("/api/usage")
+def usage(user_id: int = Depends(get_current_user)):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT email, plan, plan_expires_at FROM users WHERE id=%s", (user_id,))
+        user = cur.fetchone()
+        s_used, a_used = get_usage(cur, user_id)
+    plan = effective_plan(user)
+    p = PLANS[plan]
+    return {
+        "email": user["email"],
+        "plan": plan,
+        "expires": user.get("plan_expires_at"),
+        "searches_used": s_used, "searches_limit": p["searches"],
+        "analyses_used": a_used, "analyses_limit": p["analyses"],
+        "is_admin": bool(ADMIN_EMAIL) and user["email"] == ADMIN_EMAIL,
+        "support_whatsapp": SUPPORT_WHATSAPP,
+        "plans": PLANS,
+    }
+
+
+class ActivateIn(BaseModel):
+    email: str
+    plan: str
+    months: int = 1
+
+
+@app.post("/api/admin/activate")
+def admin_activate(data: ActivateIn, user_id: int = Depends(get_current_user)):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT email FROM users WHERE id=%s", (user_id,))
+        me = cur.fetchone()
+    if not ADMIN_EMAIL or me["email"] != ADMIN_EMAIL:
+        raise HTTPException(403, "غير مصرح — هذه اللوحة للمشرف فقط")
+    if data.plan not in PLANS:
+        raise HTTPException(400, "خطة غير معروفة")
+    months = max(1, min(24, data.months))
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET plan=%s, "
+            "plan_expires_at = CASE WHEN %s='free' THEN NULL ELSE NOW() + (%s || ' days')::interval END "
+            "WHERE email=%s RETURNING email, plan, plan_expires_at",
+            (data.plan, data.plan, months * 30, data.email.strip().lower()),
+        )
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "لا يوجد مستخدم مسجل بهذا البريد")
+    return row
