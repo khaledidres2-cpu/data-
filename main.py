@@ -94,6 +94,8 @@ def init_db():
         ALTER TABLE leads ADD COLUMN IF NOT EXISTS status_updated_at TIMESTAMPTZ;
         ALTER TABLE leads ADD COLUMN IF NOT EXISTS contacted_at TIMESTAMPTZ;
         ALTER TABLE leads ADD COLUMN IF NOT EXISTS deal_value NUMERIC;
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS followup_message TEXT DEFAULT '';
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS followup_generated_at TIMESTAMPTZ;
         """)
 
 
@@ -662,5 +664,88 @@ def pipeline(user_id: int = Depends(get_current_user)):
             (user_id,),
         )
         rows = cur.fetchall()
+        cur.execute(
+            "SELECT *, GREATEST(1, EXTRACT(DAY FROM NOW() - status_updated_at))::int AS days_waiting "
+            "FROM leads WHERE user_id=%s AND status='contacted' "
+            "AND status_updated_at <= NOW() - INTERVAL '3 days' "
+            "ORDER BY status_updated_at ASC LIMIT 100",
+            (user_id,),
+        )
+        followups = cur.fetchall()
     deal_total = stats.get("deal", {}).get("value", 0)
-    return {"stats": stats, "deal_total": deal_total, "leads": rows}
+    return {"stats": stats, "deal_total": deal_total, "leads": rows, "followups": followups}
+
+
+# ================== تذكير المتابعة الذكي ==================
+class FollowupIn(BaseModel):
+    language: str = "ar"
+
+
+@app.post("/api/leads/{lead_id}/followup")
+def gen_followup(lead_id: int, data: FollowupIn, user_id: int = Depends(get_current_user)):
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(500, "ANTHROPIC_API_KEY غير مضبوط في Railway")
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT company_name, business_description FROM users WHERE id=%s", (user_id,))
+        user = cur.fetchone()
+        cur.execute("SELECT * FROM leads WHERE id=%s AND user_id=%s", (lead_id, user_id))
+        lead = cur.fetchone()
+    if not lead:
+        raise HTTPException(404, "العميل غير موجود")
+
+    # إعادة استخدام الرسالة إن كانت مولدة بعد آخر تحديث حالة (توفير تكلفة)
+    if (lead.get("followup_message")
+            and lead.get("followup_generated_at")
+            and lead.get("status_updated_at")
+            and lead["followup_generated_at"] > lead["status_updated_at"]):
+        return {"message": lead["followup_message"]}
+
+    days = 3
+    if lead.get("status_updated_at"):
+        days = max(1, (datetime.datetime.now(lead["status_updated_at"].tzinfo)
+                       - lead["status_updated_at"]).days)
+
+    lang_name = "العربية" if data.language == "ar" else "English"
+    first_msg = lead.get("ai_message") or "(لا توجد — كانت رسالة عامة)"
+
+    prompt = f"""أنت مساعد مبيعات محترف. صاحب نشاط: «{user['company_name'] or 'غير محدد'}» — {user.get('business_description') or ''}
+راسل شركة «{lead['name']}» عبر واتساب ولم يصله رد منذ {days} أيام.
+الرسالة الأولى كانت: «{first_msg}»
+
+اكتب رسالة متابعة بلغة {lang_name}: جملتان قصيرتان فقط، بأسلوب مختلف تماماً عن الرسالة الأولى — خفيفة وغير ملحّة، لا تعاتب على عدم الرد ولا تقول "للتذكير"، تضيف زاوية أو فائدة جديدة، وتنتهي بسؤال يسهل الرد عليه بكلمة واحدة.
+
+أعد نص الرسالة فقط بدون أي مقدمات أو علامات."""
+
+    try:
+        resp = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5",
+                "max_tokens": 300,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=60,
+        )
+    except Exception:
+        raise HTTPException(502, "تعذر الاتصال بخدمة التحليل — أعد المحاولة")
+    if resp.status_code != 200:
+        raise HTTPException(502, f"خطأ من خدمة التحليل: {resp.text[:300]}")
+
+    text = "".join(b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text").strip()
+    if not text:
+        raise HTTPException(502, "تعذرت كتابة الرسالة — أعد المحاولة")
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE leads SET followup_message=%s, followup_generated_at=NOW() WHERE id=%s AND user_id=%s",
+            (text, lead_id, user_id),
+        )
+    return {"message": text}
