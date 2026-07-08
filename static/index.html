@@ -123,6 +123,13 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
 .pipe-stat{border-radius:99px;padding:7px 14px;font-size:13px;font-weight:700;border:1.5px solid var(--line);background:#fff;color:var(--muted)}
 .pipe-stat.active{outline:2px solid var(--ink)}
 .pipe-total{margin-inline-start:auto;font-weight:900;color:#15803D;font-size:14px}
+.fu-head{font-weight:900;font-size:16px;margin:4px 0 10px;color:#B45309}
+.lead.follow{border-color:#FDE68A;background:#FFFBEB}
+.wait-badge{background:#FEF3C7;color:#B45309;border-radius:99px;padding:4px 12px;font-size:12.5px;font-weight:700}
+.fu-msg{background:#fff;border:1.5px dashed #FCD34D;border-radius:10px;padding:10px 12px;font-size:13.5px;line-height:1.8;margin-top:8px}
+.btn-fu{background:#FEF3C7;color:#B45309}
+.btn-fu:hover{background:#FDE68A}
+#followBox{margin-bottom:16px}
 .btn-pdf{background:var(--primary);color:#fff;border-radius:10px;padding:9px 18px;font-size:14px;font-weight:700}
 .btn-pdf:hover{background:var(--primary-dark)}
 .btn-pdf:disabled{opacity:.6;cursor:wait}
@@ -195,6 +202,7 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
       <div id="resultsList"><div class="status" id="emptyResults"></div></div>
     </div>
     <div id="panelPipeline" class="hidden">
+      <div id="followBox"></div>
       <div class="pipe-stats" id="pipeStats"></div>
       <div id="pipelineList"></div>
     </div>
@@ -268,7 +276,11 @@ const T = {
     statuses:{new:"جديد", contacted:"تم التواصل", replied:"رد عليّ", interested:"مهتم", meeting:"اجتماع", deal:"صفقة ✅", lost:"غير مناسب"},
     dealTotal:"قيمة الصفقات", dealPrompt:"قيمة الصفقة بالدرهم (اختياري — اتركها فارغة إن لم تُحدد):",
     statusSaved:"تم تحديث الحالة",
-    emptyPipeline:"لا يوجد عملاء هنا بعد — غيّر حالة أي عميل من النتائج (أو اضغط واتساب) وسيظهر تلقائياً"
+    emptyPipeline:"لا يوجد عملاء هنا بعد — غيّر حالة أي عميل من النتائج (أو اضغط واتساب) وسيظهر تلقائياً",
+    needFollowup:(n)=>`⏰ يحتاجون متابعة (${n})`,
+    waitDays:(d)=> d===1?"مر يوم بلا رد":d===2?"مر يومان بلا رد":d<=10?`مرت ${d} أيام بلا رد`:`مر ${d} يوماً بلا رد`,
+    genFollowup:"رسالة متابعة", fuWriting:"جارٍ الكتابة…",
+    fuBumped:"تم — سيعود للتذكير بعد 3 أيام إن لم يرد"
   },
   en: {
     langBtn:"عربي", logout:"Log out",
@@ -305,7 +317,11 @@ const T = {
     statuses:{new:"New", contacted:"Contacted", replied:"Replied", interested:"Interested", meeting:"Meeting", deal:"Deal ✅", lost:"Not a fit"},
     dealTotal:"Deals value", dealPrompt:"Deal value in AED (optional — leave empty if unknown):",
     statusSaved:"Status updated",
-    emptyPipeline:"Nothing here yet — set a status on any lead (or tap WhatsApp) and it appears automatically"
+    emptyPipeline:"Nothing here yet — set a status on any lead (or tap WhatsApp) and it appears automatically",
+    needFollowup:(n)=>`⏰ Need follow-up (${n})`,
+    waitDays:(d)=>`${d} day${d>1?"s":""} with no reply`,
+    genFollowup:"Follow-up message", fuWriting:"Writing…",
+    fuBumped:"Done — will remind again in 3 days if no reply"
   }
 };
 
@@ -495,6 +511,10 @@ async function loadPipeline(){
 }
 
 function renderPipeline(){
+  const fus = pipeData.followups || [];
+  $("followBox").innerHTML = fus.length
+    ? `<div class="fu-head">${t().needFollowup(fus.length)}</div>` + fus.map(followCard).join("")
+    : "";
   const st = pipeData.stats || {};
   const order = ["contacted","replied","interested","meeting","deal","lost"];
   $("pipeStats").innerHTML = order.map(k => {
@@ -506,6 +526,47 @@ function renderPipeline(){
 }
 
 function setPipeFilter(k){ pipeFilter = pipeFilter===k ? "" : k; renderPipeline(); }
+
+function followCard(l){
+  return `
+    <div class="lead follow">
+      <div class="lead-info">
+        <div class="lead-name">${esc(l.name)} <span class="wait-badge">${t().waitDays(l.days_waiting||3)}</span></div>
+        <div class="lead-addr">${esc(l.address)}</div>
+        <div class="lead-meta" style="margin-top:8px" id="fu-${l.id}">
+          <button class="btn-mini btn-fu" onclick="genFollowup(${l.id}, this)">✨ ${t().genFollowup}</button>
+          ${l.phone ? `<span class="lead-phone">${esc(l.phone)}</span>` : ""}
+        </div>
+      </div>
+    </div>`;
+}
+
+async function genFollowup(id, btn){
+  btn.disabled = true; btn.textContent = t().fuWriting;
+  try{
+    const d = await api(`/api/leads/${id}/followup`, {method:"POST", body:JSON.stringify({language:lang})});
+    const l = (pipeData.followups||[]).find(x=>x.id===id) || {};
+    const wa = l.whatsapp ? `${esc(l.whatsapp)}?text=${encodeURIComponent(d.message)}` : "";
+    $(`fu-${id}`).innerHTML = `
+      <div style="width:100%">
+        <div class="fu-msg">${esc(d.message)}</div>
+        <div class="lead-meta" style="margin-top:8px">
+          ${wa ? `<a class="btn-wa" href="${wa}" target="_blank" rel="noopener" onclick="fuSent(${id}, this)">💬 ${t().whatsapp}</a>` : ""}
+          <button class="btn-mini" data-msg="${esc(d.message)}" onclick="copyMsg(this)">📋 ${t().msgCopy}</button>
+        </div>
+      </div>`;
+  }catch(e){
+    toast(e.message, true);
+    btn.disabled = false; btn.textContent = "✨ " + t().genFollowup;
+  }
+}
+
+function fuSent(id, el){
+  api(`/api/leads/${id}/status`, {method:"POST", body:JSON.stringify({status:"contacted"})}).catch(()=>{});
+  const card = el.closest(".lead");
+  if(card) setTimeout(()=> card.remove(), 400);
+  toast(t().fuBumped);
+}
 
 async function setStatus(id, sel){
   const status = sel.value;
