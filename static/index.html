@@ -111,6 +111,18 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
 .bar-actions{display:flex;gap:8px}
 .ai-badge{background:#F1EAFD;color:#6D28D9;border-radius:99px;padding:4px 12px;font-size:13px;font-weight:900}
 .ai-reason{color:#6D28D9;font-size:13px;margin-top:6px;line-height:1.5}
+.status-sel{border:1.5px solid var(--line);border-radius:8px;padding:7px 10px;font-size:13px;font-weight:700;background:#fff;cursor:pointer;font-family:inherit;color:var(--muted)}
+.st-contacted{color:#1D4ED8;border-color:#BFDBFE;background:#EFF6FF}
+.st-replied{color:#0F766E;border-color:#99F6E4;background:#F0FDFA}
+.st-interested{color:#B45309;border-color:#FDE68A;background:#FFFBEB}
+.st-meeting{color:#6D28D9;border-color:#DDD6FE;background:#F5F3FF}
+.st-deal{color:#15803D;border-color:#BBF7D0;background:#F0FDF4}
+.st-lost{color:#B91C1C;border-color:#FECACA;background:#FEF2F2}
+.deal-val{color:#15803D;font-weight:700}
+.pipe-stats{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+.pipe-stat{border-radius:99px;padding:7px 14px;font-size:13px;font-weight:700;border:1.5px solid var(--line);background:#fff;color:var(--muted)}
+.pipe-stat.active{outline:2px solid var(--ink)}
+.pipe-total{margin-inline-start:auto;font-weight:900;color:#15803D;font-size:14px}
 .btn-pdf{background:var(--primary);color:#fff;border-radius:10px;padding:9px 18px;font-size:14px;font-weight:700}
 .btn-pdf:hover{background:var(--primary-dark)}
 .btn-pdf:disabled{opacity:.6;cursor:wait}
@@ -175,11 +187,16 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
   <div class="container">
     <div class="tabs">
       <button class="tab active" id="tabResults" onclick="showTab('results')"></button>
+      <button class="tab" id="tabPipeline" onclick="showTab('pipeline')"></button>
       <button class="tab" id="tabHistory" onclick="showTab('history')"></button>
     </div>
     <div id="panelResults">
       <div class="count-bar hidden" id="countBar"><span id="countTxt"></span><div class="bar-actions"><button class="btn-ai" id="aiBtn" onclick="runAnalyze()"></button><button class="btn-pdf" id="pdfBtn" onclick="downloadPDF()"></button></div></div>
       <div id="resultsList"><div class="status" id="emptyResults"></div></div>
+    </div>
+    <div id="panelPipeline" class="hidden">
+      <div class="pipe-stats" id="pipeStats"></div>
+      <div id="pipelineList"></div>
     </div>
     <div id="panelHistory" class="hidden">
       <div id="historyList"><div class="status" id="emptyHistory"></div></div>
@@ -246,7 +263,12 @@ const T = {
     ai:"✨ تحليل ذكي", aiWorking:"جارٍ التحليل… (قد يستغرق دقيقة)",
     aiScore:(s)=>`ملاءمة ${s}/10`, aiDone:"اكتمل التحليل — رُتبت النتائج حسب الملاءمة",
     aiProgress:(d,tot)=>`جارٍ التحليل… ${d}/${tot}`,
-    msgCopy:"نسخ الرسالة", msgCopied:"تم نسخ الرسالة"
+    msgCopy:"نسخ الرسالة", msgCopied:"تم نسخ الرسالة",
+    tabPipeline:"خط السير",
+    statuses:{new:"جديد", contacted:"تم التواصل", replied:"رد عليّ", interested:"مهتم", meeting:"اجتماع", deal:"صفقة ✅", lost:"غير مناسب"},
+    dealTotal:"قيمة الصفقات", dealPrompt:"قيمة الصفقة بالدرهم (اختياري — اتركها فارغة إن لم تُحدد):",
+    statusSaved:"تم تحديث الحالة",
+    emptyPipeline:"لا يوجد عملاء هنا بعد — غيّر حالة أي عميل من النتائج (أو اضغط واتساب) وسيظهر تلقائياً"
   },
   en: {
     langBtn:"عربي", logout:"Log out",
@@ -278,7 +300,12 @@ const T = {
     ai:"✨ AI Analysis", aiWorking:"Analyzing… (may take a minute)",
     aiScore:(s)=>`Fit ${s}/10`, aiDone:"Analysis complete — results sorted by fit",
     aiProgress:(d,tot)=>`Analyzing… ${d}/${tot}`,
-    msgCopy:"Copy message", msgCopied:"Message copied"
+    msgCopy:"Copy message", msgCopied:"Message copied",
+    tabPipeline:"Pipeline",
+    statuses:{new:"New", contacted:"Contacted", replied:"Replied", interested:"Interested", meeting:"Meeting", deal:"Deal ✅", lost:"Not a fit"},
+    dealTotal:"Deals value", dealPrompt:"Deal value in AED (optional — leave empty if unknown):",
+    statusSaved:"Status updated",
+    emptyPipeline:"Nothing here yet — set a status on any lead (or tap WhatsApp) and it appears automatically"
   }
 };
 
@@ -315,6 +342,7 @@ function applyLang(){
   $("searchBtn").textContent = t().searchBtn;
   $("tabResults").textContent = t().tabResults;
   $("tabHistory").textContent = t().tabHistory;
+  $("tabPipeline").textContent = t().tabPipeline;
   $("emptyResults") && ($("emptyResults").textContent = t().emptyResults);
   $("emptyHistory") && ($("emptyHistory").textContent = t().emptyHistory);
   $("chips").innerHTML = t().chips.map(c =>
@@ -365,9 +393,12 @@ function showApp(){
 function showTab(name){
   $("tabResults").classList.toggle("active", name==="results");
   $("tabHistory").classList.toggle("active", name==="history");
+  $("tabPipeline").classList.toggle("active", name==="pipeline");
   $("panelResults").classList.toggle("hidden", name!=="results");
   $("panelHistory").classList.toggle("hidden", name!=="history");
+  $("panelPipeline").classList.toggle("hidden", name!=="pipeline");
   if(name==="history") loadHistory();
+  if(name==="pipeline") loadPipeline();
 }
 
 /* ---------------- الطلبات ---------------- */
@@ -406,14 +437,15 @@ async function runSearch(){
 
 function esc(s){ return (s||"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
-function renderLeads(leads, query){
-  if(!leads.length){
-    $("resultsList").innerHTML = `<div class="status">${t().emptyResults}</div>`;
-    return;
-  }
-  $("countBar").classList.remove("hidden");
-  $("countTxt").textContent = t().resultsFor(leads.length, query);
-  $("resultsList").innerHTML = leads.map(l => `
+function statusSelect(l){
+  const st = l.status || "new";
+  const opts = Object.entries(t().statuses).map(([k,v]) =>
+    `<option value="${k}" ${k===st?"selected":""}>${v}</option>`).join("");
+  return `<select class="status-sel st-${st}" onchange="setStatus(${l.id}, this)">${opts}</select>`;
+}
+
+function leadCard(l){
+  return `
     <div class="lead">
       <div class="lead-info">
         <div class="lead-name">${esc(l.name)} ${l.ai_score ? `<span class="ai-badge">${t().aiScore(l.ai_score)}</span>` : ""}</div>
@@ -421,8 +453,10 @@ function renderLeads(leads, query){
         <div class="lead-meta">
           ${l.rating ? `<span class="rating">★ ${l.rating}</span><span>(${l.reviews_count||0} ${t().reviews})</span>` : ""}
           ${l.phone ? `<span class="lead-phone">${esc(l.phone)}</span>` : ""}
+          ${l.deal_value ? `<span class="deal-val">💰 ${Number(l.deal_value).toLocaleString()} AED</span>` : ""}
         </div>
         <div class="lead-meta" style="margin-top:8px">
+          ${l.id ? statusSelect(l) : ""}
           ${l.phone ? `<a class="btn-mini" href="tel:${esc(l.phone).replace(/\s/g,'')}">📞 ${t().call}</a>
           <button class="btn-mini" onclick="copyPhone('${esc(l.phone)}')">📋 ${t().copy}</button>` : ""}
           ${l.ai_message ? `<button class="btn-mini" data-msg="${esc(l.ai_message)}" onclick="copyMsg(this)">💬 ${t().msgCopy}</button>` : ""}
@@ -431,12 +465,71 @@ function renderLeads(leads, query){
       </div>
       <div class="lead-actions">
         ${l.whatsapp
-          ? `<a class="btn-wa" href="${esc(l.whatsapp)}${l.ai_message ? '?text='+encodeURIComponent(l.ai_message) : ''}" target="_blank" rel="noopener">💬 ${t().whatsapp}</a>`
+          ? `<a class="btn-wa" href="${esc(l.whatsapp)}${l.ai_message ? '?text='+encodeURIComponent(l.ai_message) : ''}" target="_blank" rel="noopener" onclick="waClicked(this, ${l.id||0})">💬 ${t().whatsapp}</a>`
           : `<span class="no-wa">${t().noPhone}</span>`}
         ${l.website ? `<a class="btn-sec" href="${esc(l.website)}" target="_blank" rel="noopener">${t().website}</a>` : ""}
         ${l.maps_url ? `<a class="btn-sec" href="${esc(l.maps_url)}" target="_blank" rel="noopener">${t().maps}</a>` : ""}
       </div>
-    </div>`).join("");
+    </div>`;
+}
+
+function renderLeads(leads, query){
+  if(!leads.length){
+    $("resultsList").innerHTML = `<div class="status">${t().emptyResults}</div>`;
+    return;
+  }
+  $("countBar").classList.remove("hidden");
+  $("countTxt").textContent = t().resultsFor(leads.length, query);
+  $("resultsList").innerHTML = leads.map(leadCard).join("");
+}
+
+/* ---------------- خط السير ---------------- */
+let pipeData = null, pipeFilter = "";
+
+async function loadPipeline(){
+  $("pipelineList").innerHTML = `<div class="status">${t().loading}</div>`;
+  try{
+    pipeData = await api("/api/pipeline");
+    renderPipeline();
+  }catch(e){ $("pipelineList").innerHTML = `<div class="status">${e.message}</div>`; }
+}
+
+function renderPipeline(){
+  const st = pipeData.stats || {};
+  const order = ["contacted","replied","interested","meeting","deal","lost"];
+  $("pipeStats").innerHTML = order.map(k => {
+    const c = (st[k] && st[k].count) || 0;
+    return `<button class="pipe-stat st-${k} ${pipeFilter===k?"active":""}" onclick="setPipeFilter('${k}')">${t().statuses[k]}: ${c}</button>`;
+  }).join("") + `<span class="pipe-total">💰 ${t().dealTotal}: ${Number(pipeData.deal_total||0).toLocaleString()} AED</span>`;
+  const leads = (pipeData.leads||[]).filter(l => !pipeFilter || l.status===pipeFilter);
+  $("pipelineList").innerHTML = leads.length ? leads.map(leadCard).join("") : `<div class="status">${t().emptyPipeline}</div>`;
+}
+
+function setPipeFilter(k){ pipeFilter = pipeFilter===k ? "" : k; renderPipeline(); }
+
+async function setStatus(id, sel){
+  const status = sel.value;
+  let deal_value = null;
+  if(status === "deal"){
+    const v = prompt(t().dealPrompt, "");
+    if(v !== null && v.trim() !== "" && !isNaN(parseFloat(v))) deal_value = parseFloat(v);
+  }
+  try{
+    await api(`/api/leads/${id}/status`, {method:"POST", body:JSON.stringify({status, deal_value})});
+    sel.className = "status-sel st-" + status;
+    toast(t().statusSaved);
+    if(!$("panelPipeline").classList.contains("hidden")) loadPipeline();
+  }catch(e){ toast(e.message, true); }
+}
+
+function waClicked(el, id){
+  if(!id) return;
+  const sel = el.closest(".lead").querySelector(".status-sel");
+  if(sel && sel.value === "new"){
+    api(`/api/leads/${id}/status`, {method:"POST", body:JSON.stringify({status:"contacted"})}).catch(()=>{});
+    sel.value = "contacted";
+    sel.className = "status-sel st-contacted";
+  }
 }
 
 /* ---------------- السجل ---------------- */
