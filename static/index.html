@@ -338,6 +338,8 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
 
     <div class="acct-box">
       <h4 id="acctTitle"></h4>
+      <div class="usr-meta" style="margin-bottom:12px"><span id="acctNowLbl"></span>
+        <b dir="ltr" id="acctNow" style="color:var(--ink)"></b></div>
       <div class="acct-row">
         <div class="field"><label id="acctLblEmail"></label><input id="acctEmail" type="email" dir="ltr"></div>
         <div class="field"><label id="acctLblPw1"></label><input id="acctPw1" type="password" dir="ltr"></div>
@@ -462,7 +464,10 @@ const T = {
     acctEmail:"البريد الجديد", acctPwConfirm:"كلمة المرور الحالية للتأكيد",
     acctCur:"كلمة المرور الحالية", acctNew:"كلمة المرور الجديدة",
     acctSaveEmail:"تغيير البريد", acctSavePw:"تغيير كلمة المرور",
-    emailChanged:"تم تغيير البريد بنجاح", pwChanged:"تم تغيير كلمة المرور بنجاح"
+    emailChanged:"تم تغيير البريد بنجاح", pwChanged:"تم تغيير كلمة المرور بنجاح",
+    acctNow:"البريد الحالي للحساب:",
+    reloginMsg:"تم الحفظ — سجّل الدخول ببياناتك الجديدة",
+    needDeploy:"الخادم لا يعرف هذه الميزة بعد — تأكد من رفع ملف main.py المحدّث على GitHub"
   },
   en: {
     langBtn:"عربي", logout:"Log out",
@@ -550,7 +555,10 @@ const T = {
     acctEmail:"New email", acctPwConfirm:"Current password to confirm",
     acctCur:"Current password", acctNew:"New password",
     acctSaveEmail:"Change email", acctSavePw:"Change password",
-    emailChanged:"Email changed successfully", pwChanged:"Password changed successfully"
+    emailChanged:"Email changed successfully", pwChanged:"Password changed successfully",
+    acctNow:"Current account email:",
+    reloginMsg:"Saved — please log in with your new credentials",
+    needDeploy:"The server doesn't know this feature yet — make sure the updated main.py is pushed to GitHub"
   }
 };
 
@@ -602,6 +610,7 @@ function applyLang(){
   applyAuthMode();
   applyLanding();
   $("acctTitle").textContent = t().acctTitle;
+  $("acctNowLbl").textContent = t().acctNow;
   $("acctLblEmail").textContent = t().acctEmail;
   $("acctLblPw1").textContent = t().acctPwConfirm;
   $("acctLblCur").textContent = t().acctCur;
@@ -947,6 +956,7 @@ async function loadCompany(){
   try{ companyData = await api("/api/company"); }catch(e){}
 }
 function openSettings(){
+  $("acctNow").textContent = (usageData && usageData.email) || "";
   $("setCompany").value = companyData.company_name || "";
   $("setDesc").value = companyData.business_description || "";
   const p = $("logoPreview");
@@ -1002,13 +1012,13 @@ function copyPhone(p){
 async function changeEmail(){
   const btn = $("acctEmailBtn"); btn.disabled = true;
   try{
-    await api("/api/account/email", {method:"POST", body:JSON.stringify({
+    const d = await api("/api/account/email", {method:"POST", body:JSON.stringify({
       new_email: $("acctEmail").value, password: $("acctPw1").value })});
-    toast(t().emailChanged);
+    $("acctNow").textContent = d.email;
     $("acctEmail").value = ""; $("acctPw1").value = "";
-    loadUsage();
-  }catch(e){ toast(e.message, true); }
-  btn.disabled = false;
+    toast(t().emailChanged + " — " + t().reloginMsg);
+    setTimeout(logout, 1800);
+  }catch(e){ toast(e.status === 404 ? t().needDeploy : e.message, true); btn.disabled = false; }
 }
 
 async function changePassword(){
@@ -1016,10 +1026,10 @@ async function changePassword(){
   try{
     await api("/api/account/password", {method:"POST", body:JSON.stringify({
       current_password: $("acctCur").value, new_password: $("acctNew").value })});
-    toast(t().pwChanged);
     $("acctCur").value = ""; $("acctNew").value = "";
-  }catch(e){ toast(e.message, true); }
-  btn.disabled = false;
+    toast(t().pwChanged + " — " + t().reloginMsg);
+    setTimeout(logout, 1800);
+  }catch(e){ toast(e.status === 404 ? t().needDeploy : e.message, true); btn.disabled = false; }
 }
 
 /* ---------------- الاستخدام والخطط ---------------- */
@@ -1035,6 +1045,7 @@ async function loadUsage(){
 
 function renderUsage(){
   if(!usageData){ $("usageBar").innerHTML = ""; return; }
+  $("acctNow").textContent = usageData.email || "";
   const u = usageData;
   $("usageBar").innerHTML =
     `<span dir="ltr">${esc(u.email||"")}</span> · ` +
