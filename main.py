@@ -929,8 +929,11 @@ def change_email(data: ChangeEmailIn, user_id: int = Depends(get_current_user)):
         cur.execute("SELECT id FROM users WHERE email=%s AND id<>%s", (new_email, user_id))
         if cur.fetchone():
             raise HTTPException(400, "هذا البريد مستخدم في حساب آخر")
-        cur.execute("UPDATE users SET email=%s WHERE id=%s", (new_email, user_id))
-    return {"ok": True, "email": new_email}
+        cur.execute("UPDATE users SET email=%s WHERE id=%s RETURNING email", (new_email, user_id))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(500, "لم يتم حفظ البريد — أعد المحاولة")
+    return {"ok": True, "email": row["email"]}
 
 
 @app.post("/api/account/password")
@@ -940,6 +943,9 @@ def change_password(data: ChangePasswordIn, user_id: int = Depends(get_current_u
     _verify_own_password(user_id, data.current_password)
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("UPDATE users SET password_hash=%s WHERE id=%s",
+        cur.execute("UPDATE users SET password_hash=%s WHERE id=%s RETURNING id",
                     (hash_password(data.new_password), user_id))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(500, "لم يتم حفظ كلمة المرور — أعد المحاولة")
     return {"ok": True}
