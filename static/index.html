@@ -1,918 +1,945 @@
-<!DOCTYPE html>
-<html lang="ar" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Lead Finder — باحث العملاء</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;900&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+# -*- coding: utf-8 -*-
+"""
+Lead Finder - أداة توليد العملاء
+FastAPI + PostgreSQL + Google Places API (New)
+المرحلة 1: بحث + حفظ النتائج + واتساب مباشر
+"""
+import os
+import re
+import hashlib
+import secrets
+import datetime
+from contextlib import contextmanager
+
+import jwt
+import httpx
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# ---------------- الإعدادات ----------------
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-in-railway")
+GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "")
+JWT_ALGO = "HS256"
+TOKEN_DAYS = 30
+
+app = FastAPI(title="Lead Finder API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------- الخطط والحصص ----------------
+PLANS = {
+    "free":  {"searches": 3,   "analyses": 1,   "price": 0},
+    "basic": {"searches": 30,  "analyses": 30,  "price": 99},
+    "pro":   {"searches": 100, "analyses": 100, "price": 199},
+}
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()
+SUPPORT_WHATSAPP = re.sub(r"\D", "", os.environ.get("SUPPORT_WHATSAPP", ""))
+
+
+def is_admin_user(user) -> bool:
+    """أدمن إذا طابق ADMIN_EMAIL، أو كان أول حساب مسجل في النظام (المالك)."""
+    email = (user.get("email") or "").strip().lower()
+    if ADMIN_EMAIL and email == ADMIN_EMAIL:
+        return True
+    return user.get("id") == 1
+
+
+def effective_plan(user) -> str:
+    plan = user.get("plan") or "free"
+    if plan not in PLANS:
+        return "free"
+    if plan != "free":
+        exp = user.get("plan_expires_at")
+        if not exp or exp < datetime.datetime.now(exp.tzinfo):
+            return "free"  # انتهى الاشتراك
+    return plan
+
+
+def get_usage(cur, user_id: int):
+    cur.execute(
+        "SELECT COUNT(*) AS c FROM searches WHERE user_id=%s "
+        "AND created_at >= date_trunc('month', NOW())", (user_id,))
+    s = cur.fetchone()["c"]
+    cur.execute(
+        "SELECT COUNT(*) AS c FROM searches WHERE user_id=%s "
+        "AND analyzed_at >= date_trunc('month', NOW())", (user_id,))
+    a = cur.fetchone()["c"]
+    return s, a
+
+
+# ---------------- قاعدة البيانات ----------------
+@contextmanager
+def get_db():
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db():
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            company_name TEXT DEFAULT '',
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS searches (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            query TEXT NOT NULL,
+            results_count INTEGER DEFAULT 0,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS leads (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            search_id INTEGER REFERENCES searches(id) ON DELETE SET NULL,
+            place_id TEXT NOT NULL,
+            name TEXT DEFAULT '',
+            phone TEXT DEFAULT '',
+            whatsapp TEXT DEFAULT '',
+            address TEXT DEFAULT '',
+            rating REAL,
+            reviews_count INTEGER,
+            website TEXT DEFAULT '',
+            maps_url TEXT DEFAULT '',
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE (user_id, place_id)
+        );
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS logo_base64 TEXT DEFAULT '';
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS business_description TEXT DEFAULT '';
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS plan TEXT DEFAULT 'free';
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_expires_at TIMESTAMPTZ;
+        ALTER TABLE searches ADD COLUMN IF NOT EXISTS analyzed_at TIMESTAMPTZ;
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS ai_score REAL;
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS ai_reason TEXT DEFAULT '';
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS ai_message TEXT DEFAULT '';
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'new';
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS status_updated_at TIMESTAMPTZ;
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS contacted_at TIMESTAMPTZ;
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS deal_value NUMERIC;
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS followup_message TEXT DEFAULT '';
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS followup_generated_at TIMESTAMPTZ;
+        """)
+
+
+@app.on_event("startup")
+def startup():
+    if DATABASE_URL:
+        init_db()
+
+# ---------------- كلمات المرور والتوكن ----------------
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex()
+    return f"{salt}${h}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        salt, h = stored.split("$")
+        return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex() == h
+    except Exception:
+        return False
+
+
+def create_token(user_id: int) -> str:
+    payload = {
+        "sub": str(user_id),
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(days=TOKEN_DAYS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+
+def get_current_user(authorization: str = Header(default="")):
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(401, "غير مصرح / Unauthorized")
+    token = authorization[7:]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        return int(payload["sub"])
+    except Exception:
+        raise HTTPException(401, "جلسة منتهية / Session expired")
+
+# ---------------- النماذج ----------------
+class RegisterIn(BaseModel):
+    email: str
+    password: str
+    company_name: str = ""
+
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
+
+class SearchIn(BaseModel):
+    query: str
+    language: str = "ar"  # لغة نتائج Google
+    strict_city: bool = True  # استبعاد النتائج خارج المدينة المكتوبة
+
+# ---------------- المصادقة ----------------
+@app.post("/api/register")
+def register(data: RegisterIn):
+    email = data.email.strip().lower()
+    if not email or len(data.password) < 6:
+        raise HTTPException(400, "بيانات غير صالحة (كلمة المرور 6 أحرف على الأقل)")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM users WHERE email=%s", (email,))
+        if cur.fetchone():
+            raise HTTPException(400, "البريد مسجل مسبقاً / Email already registered")
+        cur.execute(
+            "INSERT INTO users (email, password_hash, company_name) VALUES (%s,%s,%s) RETURNING id",
+            (email, hash_password(data.password), data.company_name.strip()),
+        )
+        user_id = cur.fetchone()["id"]
+    return {"token": create_token(user_id), "company_name": data.company_name.strip()}
+
+
+@app.post("/api/login")
+def login(data: LoginIn):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE email=%s", (data.email.strip().lower(),))
+        user = cur.fetchone()
+    if not user or not verify_password(data.password, user["password_hash"]):
+        raise HTTPException(401, "بيانات الدخول غير صحيحة / Invalid credentials")
+    return {"token": create_token(user["id"]), "company_name": user["company_name"]}
+
+
+@app.get("/api/me")
+def me(user_id: int = Depends(get_current_user)):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, email, company_name, created_at FROM users WHERE id=%s", (user_id,))
+        user = cur.fetchone()
+    if not user:
+        raise HTTPException(404, "المستخدم غير موجود")
+    return user
+
+# ---------------- البحث عبر Google Places ----------------
+def phone_to_whatsapp(phone: str) -> str:
+    digits = re.sub(r"\D", "", phone or "")
+    return f"https://wa.me/{digits}" if len(digits) >= 8 else ""
+
+
+@app.post("/api/search")
+def search(data: SearchIn, user_id: int = Depends(get_current_user)):
+    query = data.query.strip()
+    if not query:
+        raise HTTPException(400, "اكتب القطاع والمدينة أولاً")
+    if not GOOGLE_PLACES_API_KEY:
+        raise HTTPException(500, "GOOGLE_PLACES_API_KEY غير مضبوط في Railway")
+
+    # فرض حد البحث الشهري حسب الخطة
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT plan, plan_expires_at FROM users WHERE id=%s", (user_id,))
+        u = cur.fetchone()
+        s_used, _ = get_usage(cur, user_id)
+    plan = effective_plan(u)
+    if s_used >= PLANS[plan]["searches"]:
+        raise HTTPException(402, "استنفدت حصة البحث لهذا الشهر — رقِّ خطتك لمواصلة توليد العملاء")
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+        "X-Goog-FieldMask": (
+            "nextPageToken,places.id,places.displayName,places.formattedAddress,"
+            "places.internationalPhoneNumber,places.nationalPhoneNumber,"
+            "places.rating,places.userRatingCount,places.websiteUri,places.googleMapsUri"
+        ),
+    }
+
+    # نجلب حتى 3 صفحات (60 نتيجة كحد أقصى)
+    places, page_token = [], None
+    for _ in range(3):
+        body = {"textQuery": query, "languageCode": data.language, "maxResultCount": 20}
+        if page_token:
+            body["pageToken"] = page_token
+        try:
+            resp = httpx.post(
+                "https://places.googleapis.com/v1/places:searchText",
+                headers=headers, json=body, timeout=30,
+            )
+        except Exception:
+            if places:
+                break
+            raise HTTPException(502, "تعذر الاتصال بخدمة Google")
+        if resp.status_code != 200:
+            if places:
+                break
+            raise HTTPException(502, f"خطأ من Google Places: {resp.text[:300]}")
+        j = resp.json()
+        places.extend(j.get("places", []))
+        page_token = j.get("nextPageToken")
+        if not page_token:
+            break
+
+    # فلتر المدينة: نستبعد النتائج التي لا يظهر في عنوانها آخر كلمة من البحث (اسم المدينة عادةً)
+    if data.strict_city:
+        tokens = [w for w in re.split(r"\s+", query) if len(w) >= 3]
+        if len(tokens) >= 2:  # لا نفلتر إذا كان البحث كلمة واحدة
+            city = tokens[-1].lower()
+            filtered = [p for p in places if city in (p.get("formattedAddress", "") or "").lower()]
+            if filtered:  # إذا الفلتر صفّر النتائج نبقي الأصل بدل صفحة فارغة
+                places = filtered
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO searches (user_id, query) VALUES (%s,%s) RETURNING id",
+            (user_id, query),
+        )
+        search_id = cur.fetchone()["id"]
+
+        results = []
+        for p in places:
+            phone = p.get("internationalPhoneNumber") or p.get("nationalPhoneNumber") or ""
+            lead = {
+                "place_id": p.get("id", ""),
+                "name": (p.get("displayName") or {}).get("text", ""),
+                "phone": phone,
+                "whatsapp": phone_to_whatsapp(phone),
+                "address": p.get("formattedAddress", ""),
+                "rating": p.get("rating"),
+                "reviews_count": p.get("userRatingCount"),
+                "website": p.get("websiteUri", ""),
+                "maps_url": p.get("googleMapsUri", ""),
+            }
+            cur.execute("""
+                INSERT INTO leads (user_id, search_id, place_id, name, phone, whatsapp,
+                                   address, rating, reviews_count, website, maps_url)
+                VALUES (%(user_id)s, %(search_id)s, %(place_id)s, %(name)s, %(phone)s,
+                        %(whatsapp)s, %(address)s, %(rating)s, %(reviews_count)s,
+                        %(website)s, %(maps_url)s)
+                ON CONFLICT (user_id, place_id) DO UPDATE SET
+                    phone = EXCLUDED.phone,
+                    whatsapp = EXCLUDED.whatsapp,
+                    rating = EXCLUDED.rating,
+                    reviews_count = EXCLUDED.reviews_count
+            """, {**lead, "user_id": user_id, "search_id": search_id})
+            results.append(lead)
+
+        cur.execute("UPDATE searches SET results_count=%s WHERE id=%s", (len(results), search_id))
+        cur.execute(
+            "SELECT * FROM leads WHERE user_id=%s AND search_id=%s "
+            "ORDER BY rating DESC NULLS LAST",
+            (user_id, search_id),
+        )
+        rows = cur.fetchall()
+
+    return {"search_id": search_id, "count": len(rows), "leads": rows}
+
+# ---------------- السجل ----------------
+@app.get("/api/searches")
+def list_searches(user_id: int = Depends(get_current_user)):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, query, results_count, created_at FROM searches "
+            "WHERE user_id=%s ORDER BY id DESC LIMIT 50",
+            (user_id,),
+        )
+        return cur.fetchall()
+
+
+@app.get("/api/searches/{search_id}/leads")
+def search_leads(search_id: int, user_id: int = Depends(get_current_user)):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM leads WHERE user_id=%s AND search_id=%s "
+            "ORDER BY ai_score DESC NULLS LAST, rating DESC NULLS LAST",
+            (user_id, search_id),
+        )
+        return cur.fetchall()
+
+
+@app.get("/api/leads")
+def all_leads(user_id: int = Depends(get_current_user)):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM leads WHERE user_id=%s ORDER BY id DESC LIMIT 500",
+            (user_id,),
+        )
+        return cur.fetchall()
+
+# ---------------- الواجهة ----------------
+@app.get("/")
+def index():
+    return FileResponse("static/index.html")
+
+# ================== المرحلة 2: الشركة + PDF ==================
+import html as html_lib
+from fastapi.responses import Response
+
+FONT_DIR = "/tmp/fonts"
+FONT_URLS = {
+    "Tajawal-Regular.ttf": "https://raw.githubusercontent.com/google/fonts/main/ofl/tajawal/Tajawal-Regular.ttf",
+    "Tajawal-Bold.ttf": "https://raw.githubusercontent.com/google/fonts/main/ofl/tajawal/Tajawal-Bold.ttf",
+}
+
+
+def ensure_fonts():
+    os.makedirs(FONT_DIR, exist_ok=True)
+    for name, url in FONT_URLS.items():
+        path = os.path.join(FONT_DIR, name)
+        if not os.path.exists(path):
+            r = httpx.get(url, timeout=30, follow_redirects=True)
+            r.raise_for_status()
+            with open(path, "wb") as f:
+                f.write(r.content)
+
+
+class CompanyIn(BaseModel):
+    company_name: str = ""
+    logo_base64: str = ""  # data:image/...;base64,xxxx
+    business_description: str = ""  # وصف نشاط المستخدم — يستخدمه التحليل الذكي
+
+
+@app.get("/api/company")
+def get_company(user_id: int = Depends(get_current_user)):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT company_name, logo_base64, business_description FROM users WHERE id=%s", (user_id,))
+        row = cur.fetchone()
+    return {
+        "company_name": row["company_name"] or "",
+        "logo_base64": row["logo_base64"] or "",
+        "business_description": row.get("business_description") or "",
+    }
+
+
+@app.post("/api/company")
+def save_company(data: CompanyIn, user_id: int = Depends(get_current_user)):
+    if len(data.logo_base64) > 2_000_000:
+        raise HTTPException(400, "حجم الشعار كبير — اختر صورة أقل من 1.5MB")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET company_name=%s, logo_base64=%s, business_description=%s WHERE id=%s",
+            (data.company_name.strip(), data.logo_base64, data.business_description.strip(), user_id),
+        )
+    return {"ok": True}
+
+
+PDF_TEXTS = {
+    "ar": {
+        "title": "قائمة العملاء المحتملين",
+        "search": "البحث", "date": "التاريخ", "count": "عدد النتائج",
+        "name": "اسم الشركة", "phone": "الهاتف", "address": "العنوان",
+        "rating": "التقييم", "footer": "تم إنشاء هذه القائمة بواسطة",
+        "dir": "rtl", "align": "right",
+    },
+    "en": {
+        "title": "Prospective Leads List",
+        "search": "Search", "date": "Date", "count": "Results",
+        "name": "Business", "phone": "Phone", "address": "Address",
+        "rating": "Rating", "footer": "Generated by",
+        "dir": "ltr", "align": "left",
+    },
+}
+
+
+@app.get("/api/searches/{search_id}/pdf")
+def search_pdf(search_id: int, lang: str = "ar", user_id: int = Depends(get_current_user)):
+    try:
+        from weasyprint import HTML
+    except Exception:
+        raise HTTPException(500, "مولد PDF غير جاهز — تأكد من وجود ملف nixpacks.toml في المستودع")
+
+    tx = PDF_TEXTS.get(lang, PDF_TEXTS["ar"])
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT company_name, logo_base64 FROM users WHERE id=%s", (user_id,))
+        user = cur.fetchone()
+        cur.execute("SELECT query, created_at FROM searches WHERE id=%s AND user_id=%s", (search_id, user_id))
+        s = cur.fetchone()
+        if not s:
+            raise HTTPException(404, "البحث غير موجود")
+        cur.execute(
+            "SELECT * FROM leads WHERE user_id=%s AND search_id=%s "
+            "ORDER BY ai_score DESC NULLS LAST, rating DESC NULLS LAST",
+            (user_id, search_id),
+        )
+        leads = cur.fetchall()
+
+    ensure_fonts()
+    e = html_lib.escape
+    company = e(user["company_name"] or "")
+    logo_html = f'<img class="logo" src="{user["logo_base64"]}">' if (user["logo_base64"] or "").startswith("data:image") else ""
+
+    rows = "".join(f"""
+        <tr>
+            <td class="num">{i}</td>
+            <td class="name">{e(l['name'] or '')}</td>
+            <td class="phone">{e(l['phone'] or '—')}</td>
+            <td>{e(l['address'] or '')}</td>
+            <td class="rate">{('★ ' + str(l['rating'])) if l['rating'] else '—'}</td>
+        </tr>""" for i, l in enumerate(leads, 1))
+
+    doc = f"""<!DOCTYPE html>
+<html dir="{tx['dir']}">
+<head><meta charset="utf-8">
 <style>
-:root{
-  --ink:#14231E; --muted:#5E7069; --line:#DDE5E1; --bg:#F6F8F7; --card:#FFFFFF;
-  --primary:#0E5A4E; --primary-dark:#0A423A; --wa:#1EBE5D; --wa-dark:#149C4A;
-  --sand:#C9A24B; --danger:#C0392B; --radius:14px;
-}
-*{margin:0;padding:0;box-sizing:border-box}
-html[dir="rtl"] body{font-family:'Tajawal',sans-serif}
-html[dir="ltr"] body{font-family:'IBM Plex Sans','Tajawal',sans-serif}
-body{background:var(--bg);color:var(--ink);min-height:100vh;font-size:16px}
-.hidden{display:none!important}
-button{cursor:pointer;font-family:inherit;border:none}
-input{font-family:inherit}
-
-/* ---------- الهيدر ---------- */
-header{background:var(--primary-dark);color:#fff;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;gap:10px}
-.logo{font-weight:900;font-size:20px;letter-spacing:.3px}
-.logo span{color:#8FD8B7}
-.hdr-actions{display:flex;gap:8px;align-items:center}
-.pill{background:rgba(255,255,255,.12);color:#fff;border-radius:99px;padding:7px 14px;font-size:14px;font-weight:500}
-.pill:hover{background:rgba(255,255,255,.22)}
-
-/* ---------- شاشة الدخول ---------- */
-.auth-wrap{max-width:420px;margin:56px auto;padding:0 16px}
-.auth-card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:28px}
-.auth-card h1{font-size:24px;font-weight:900;margin-bottom:6px}
-.auth-card p{color:var(--muted);font-size:14px;margin-bottom:20px}
-.field{margin-bottom:14px}
-.field label{display:block;font-size:13px;font-weight:700;margin-bottom:6px}
-.field input{width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:10px;font-size:15px;background:#FBFCFB}
-.field input:focus{outline:2px solid var(--primary);outline-offset:1px;border-color:var(--primary)}
-.field textarea{width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:10px;font-size:14.5px;background:#FBFCFB;font-family:inherit;resize:vertical;min-height:76px}
-.field textarea:focus{outline:2px solid var(--primary);outline-offset:1px;border-color:var(--primary)}
-.field .hint{font-size:12px;color:var(--muted);margin-top:4px}
-.btn-main{width:100%;background:var(--primary);color:#fff;padding:13px;border-radius:10px;font-size:16px;font-weight:700}
-.btn-main:hover{background:var(--primary-dark)}
-.btn-main:disabled{opacity:.6;cursor:wait}
-.switch-auth{text-align:center;margin-top:14px;font-size:14px;color:var(--muted)}
-.switch-auth a{color:var(--primary);font-weight:700;cursor:pointer;text-decoration:none}
-
-/* ---------- منطقة البحث (البطل) ---------- */
-.search-hero{max-width:760px;margin:40px auto 8px;padding:0 16px;text-align:center}
-.search-hero h2{font-size:26px;font-weight:900;margin-bottom:4px}
-.search-hero .sub{color:var(--muted);font-size:15px;margin-bottom:22px}
-.search-box{display:flex;gap:8px;background:var(--card);border:1.5px solid var(--line);border-radius:99px;padding:6px;box-shadow:0 4px 18px rgba(14,90,78,.07)}
-.search-box:focus-within{border-color:var(--primary)}
-.search-box input{flex:1;border:none;background:transparent;padding:10px 16px;font-size:16px;min-width:0}
-.search-box input:focus{outline:none}
-.search-box button{background:var(--primary);color:#fff;border-radius:99px;padding:11px 26px;font-size:15px;font-weight:700;white-space:nowrap}
-.search-box button:hover{background:var(--primary-dark)}
-.search-box button:disabled{opacity:.6;cursor:wait}
-.chips{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:14px}
-.filter-row{display:flex;justify-content:center;margin-top:12px}
-.filter-row label{display:flex;align-items:center;gap:7px;font-size:14px;color:var(--muted);cursor:pointer;font-weight:500}
-.filter-row input{width:17px;height:17px;accent-color:var(--primary);cursor:pointer}
-.chip{background:#E9F1EE;color:var(--primary-dark);border-radius:99px;padding:6px 14px;font-size:13px;font-weight:500}
-.chip:hover{background:#DCEAE5}
-
-/* ---------- التبويبات والنتائج ---------- */
-.container{max-width:1000px;margin:0 auto;padding:10px 16px 60px}
-.tabs{display:flex;gap:6px;margin:22px 0 14px;border-bottom:1px solid var(--line)}
-.tab{background:none;padding:10px 18px;font-size:15px;font-weight:700;color:var(--muted);border-bottom:2.5px solid transparent}
-.tab.active{color:var(--primary);border-bottom-color:var(--primary)}
-.status{text-align:center;color:var(--muted);padding:26px;font-size:15px}
-.count-bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;font-size:14px;color:var(--muted)}
-
-.lead{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:16px;margin-bottom:10px;display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap}
-.lead-info{flex:1;min-width:220px}
-.lead-name{font-size:17px;font-weight:700;margin-bottom:3px}
-.lead-addr{color:var(--muted);font-size:13.5px;margin-bottom:6px}
-.lead-meta{display:flex;gap:12px;flex-wrap:wrap;font-size:13.5px}
-.rating{color:var(--sand);font-weight:700}
-.lead-phone{direction:ltr;unicode-bidi:embed;font-weight:600}
-.lead-actions{display:flex;gap:8px;flex-wrap:wrap}
-.btn-wa{background:var(--wa);color:#fff;border-radius:10px;padding:10px 16px;font-size:14px;font-weight:700;text-decoration:none;display:inline-flex;align-items:center;gap:6px}
-.btn-wa:hover{background:var(--wa-dark)}
-.btn-sec{background:#EEF3F1;color:var(--ink);border-radius:10px;padding:10px 14px;font-size:14px;font-weight:600;text-decoration:none;display:inline-flex;align-items:center}
-.btn-sec:hover{background:#E2EAE6}
-.no-wa{color:var(--muted);font-size:13px;padding:10px 4px}
-
-.hist{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;cursor:pointer}
-.hist:hover{border-color:var(--primary)}
-.hist .q{font-weight:700}
-.hist .m{color:var(--muted);font-size:13px;margin-top:2px}
-.hist .n{background:#E9F1EE;color:var(--primary-dark);border-radius:99px;padding:4px 12px;font-size:13px;font-weight:700}
-
-.toast{position:fixed;bottom:24px;inset-inline-start:50%;transform:translateX(50%);background:var(--ink);color:#fff;padding:12px 22px;border-radius:99px;font-size:14px;z-index:99;opacity:0;transition:.3s;pointer-events:none}
-html[dir="ltr"] .toast{transform:translateX(-50%)}
-.toast.show{opacity:1}
-.toast.err{background:var(--danger)}
-
-/* ---------- إعدادات الشركة ---------- */
-.overlay{position:fixed;inset:0;background:rgba(20,35,30,.45);display:flex;align-items:center;justify-content:center;z-index:50;padding:16px}
-.modal{background:var(--card);border-radius:var(--radius);padding:24px;max-width:420px;width:100%}
-.modal h3{font-size:18px;font-weight:900;margin-bottom:16px}
-.logo-preview{max-height:60px;max-width:140px;display:block;margin-top:8px;border:1px solid var(--line);border-radius:8px;padding:4px}
-.modal-actions{display:flex;gap:8px;margin-top:18px}
-.btn-ghost{flex:1;background:#EEF3F1;color:var(--ink);padding:12px;border-radius:10px;font-size:15px;font-weight:600}
-.modal-actions .btn-main{flex:1;width:auto}
-.btn-ai{background:#7C3AED;color:#fff;border-radius:10px;padding:9px 18px;font-size:14px;font-weight:700}
-.btn-ai:hover{background:#6D28D9}
-.btn-ai:disabled{opacity:.6;cursor:wait}
-.bar-actions{display:flex;gap:8px}
-.ai-badge{background:#F1EAFD;color:#6D28D9;border-radius:99px;padding:4px 12px;font-size:13px;font-weight:900}
-.ai-reason{color:#6D28D9;font-size:13px;margin-top:6px;line-height:1.5}
-.status-sel{border:1.5px solid var(--line);border-radius:8px;padding:7px 10px;font-size:13px;font-weight:700;background:#fff;cursor:pointer;font-family:inherit;color:var(--muted)}
-.st-contacted{color:#1D4ED8;border-color:#BFDBFE;background:#EFF6FF}
-.st-replied{color:#0F766E;border-color:#99F6E4;background:#F0FDFA}
-.st-interested{color:#B45309;border-color:#FDE68A;background:#FFFBEB}
-.st-meeting{color:#6D28D9;border-color:#DDD6FE;background:#F5F3FF}
-.st-deal{color:#15803D;border-color:#BBF7D0;background:#F0FDF4}
-.st-lost{color:#B91C1C;border-color:#FECACA;background:#FEF2F2}
-.deal-val{color:#15803D;font-weight:700}
-.pipe-stats{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
-.pipe-stat{border-radius:99px;padding:7px 14px;font-size:13px;font-weight:700;border:1.5px solid var(--line);background:#fff;color:var(--muted)}
-.pipe-stat.active{outline:2px solid var(--ink)}
-.pipe-total{margin-inline-start:auto;font-weight:900;color:#15803D;font-size:14px}
-.fu-head{font-weight:900;font-size:16px;margin:4px 0 10px;color:#B45309}
-.lead.follow{border-color:#FDE68A;background:#FFFBEB}
-.wait-badge{background:#FEF3C7;color:#B45309;border-radius:99px;padding:4px 12px;font-size:12.5px;font-weight:700}
-.fu-msg{background:#fff;border:1.5px dashed #FCD34D;border-radius:10px;padding:10px 12px;font-size:13.5px;line-height:1.8;margin-top:8px}
-.btn-fu{background:#FEF3C7;color:#B45309}
-.btn-fu:hover{background:#FDE68A}
-#followBox{margin-bottom:16px}
-.usage-bar{margin-top:14px;font-size:13.5px;color:var(--muted)}
-.link-btn{background:none;border:none;color:var(--primary);font-weight:700;cursor:pointer;font-size:13px;text-decoration:underline;font-family:inherit;padding:0 4px}
-.plans-modal{max-width:720px}
-#plansGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:6px}
-.plan-card{border:1.5px solid var(--line);border-radius:12px;padding:18px 14px;text-align:center}
-.plan-card.current{border-color:var(--primary);background:#F0F7F4}
-.plan-name{font-weight:900;font-size:16px;margin-bottom:6px}
-.plan-price{font-size:22px;font-weight:900;color:var(--primary)}
-.plan-feat{color:var(--muted);font-size:13px;margin:10px 0 14px;line-height:1.8}
-.plan-cur{color:var(--primary);font-weight:700;font-size:13.5px;padding:10px 0}
-.admin-modal{max-width:820px}
-.usr{border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:8px}
-.usr-top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
-.usr-mail{font-weight:700;font-size:14.5px;direction:ltr;unicode-bidi:embed}
-.usr-meta{color:var(--muted);font-size:12.5px;margin-top:3px}
-.usr-ctl{display:flex;gap:6px;align-items:center;margin-top:10px;flex-wrap:wrap}
-.usr-ctl select,.usr-ctl input{border:1.5px solid var(--line);border-radius:8px;padding:7px 9px;font-size:13px;font-family:inherit;background:#fff}
-.usr-ctl input{width:64px}
-.btn-act{background:var(--primary);color:#fff;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:700}
-.btn-act:hover{background:var(--primary-dark)}
-.badge-plan{border-radius:99px;padding:4px 12px;font-size:12.5px;font-weight:900}
-.bp-free{background:#EEF3F1;color:var(--muted)}
-.bp-basic{background:#DBEAFE;color:#1D4ED8}
-.bp-pro{background:#EDE9FE;color:#6D28D9}
-.bp-exp{background:#FEE2E2;color:#B91C1C}
-#usersList{max-height:52vh;overflow-y:auto;margin-top:8px}
-.btn-pdf{background:var(--primary);color:#fff;border-radius:10px;padding:9px 18px;font-size:14px;font-weight:700}
-.btn-pdf:hover{background:var(--primary-dark)}
-.btn-pdf:disabled{opacity:.6;cursor:wait}
-.btn-mini{background:#EEF3F1;color:var(--ink);border-radius:8px;padding:8px 12px;font-size:13px;font-weight:600;text-decoration:none;display:inline-flex;align-items:center}
-.btn-mini:hover{background:#E2EAE6}
-@media (max-width:560px){
-  .search-hero h2{font-size:21px}
-  .lead{flex-direction:column}
-  .lead-actions{width:100%}
-  .btn-wa{flex:1;justify-content:center}
-}
-</style>
-</head>
+@font-face {{ font-family:'Tajawal'; src:url('file://{FONT_DIR}/Tajawal-Regular.ttf'); font-weight:400; }}
+@font-face {{ font-family:'Tajawal'; src:url('file://{FONT_DIR}/Tajawal-Bold.ttf'); font-weight:700; }}
+@page {{ size:A4; margin:14mm 12mm; }}
+body {{ font-family:'Tajawal'; color:#14231E; font-size:11px; }}
+table.head {{ width:100%; border-collapse:collapse; margin-bottom:14px;
+        border-bottom:3px solid #0E5A4E; }}
+table.head td {{ border:none; background:none; padding:0 0 10px 0; vertical-align:middle; }}
+.brand-cell {{ text-align:{tx['align']}; }}
+.title-cell {{ text-align:{'left' if tx['align'] == 'right' else 'right'}; }}
+.logo {{ max-height:48px; max-width:110px; vertical-align:middle; }}
+.cname {{ font-size:17px; font-weight:700; color:#0E5A4E; display:inline-block;
+        vertical-align:middle; margin:0 8px; }}
+h1 {{ font-size:16px; margin:0; color:#0E5A4E; }}
+.meta {{ color:#5E7069; font-size:10.5px; margin-bottom:12px; }}
+.meta span {{ margin-inline-end:16px; }}
+table {{ width:100%; border-collapse:collapse; }}
+th {{ background:#0E5A4E; color:#fff; padding:7px 6px; font-size:10.5px; text-align:{tx['align']}; }}
+td {{ border-bottom:1px solid #DDE5E1; padding:6px; vertical-align:top; text-align:{tx['align']}; }}
+tr:nth-child(even) td {{ background:#F3F7F5; }}
+.num {{ color:#5E7069; width:22px; }}
+.name {{ font-weight:700; }}
+.phone {{ direction:ltr; white-space:nowrap; }}
+.rate {{ color:#B8860B; white-space:nowrap; }}
+.footer {{ margin-top:14px; text-align:center; color:#8CA29A; font-size:9.5px; }}
+</style></head>
 <body>
-
-<header>
-  <div class="logo" id="logo">Lead<span>Finder</span></div>
-  <div class="hdr-actions">
-    <button class="pill" id="langBtn" onclick="toggleLang()">English</button>
-    <button class="pill hidden" id="adminBtn" onclick="openAdmin()"></button>
-    <button class="pill hidden" id="settingsBtn" onclick="openSettings()"></button>
-    <button class="pill hidden" id="logoutBtn" onclick="logout()"></button>
-  </div>
-</header>
-
-<!-- شاشة الدخول -->
-<div class="auth-wrap" id="authScreen">
-  <div class="auth-card">
-    <h1 id="authTitle"></h1>
-    <p id="authSub"></p>
-    <div class="field" id="companyField">
-      <label id="lblCompany"></label>
-      <input id="inCompany" type="text">
-    </div>
-    <div class="field">
-      <label id="lblEmail"></label>
-      <input id="inEmail" type="email" dir="ltr">
-    </div>
-    <div class="field">
-      <label id="lblPassword"></label>
-      <input id="inPassword" type="password" dir="ltr">
-    </div>
-    <button class="btn-main" id="authBtn" onclick="submitAuth()"></button>
-    <div class="switch-auth"><span id="switchTxt"></span> <a id="switchLink" onclick="toggleAuthMode()"></a></div>
-  </div>
+<table class="head"><tr>
+  <td class="brand-cell">{logo_html}<span class="cname">{company}</span></td>
+  <td class="title-cell"><h1>{tx['title']}</h1></td>
+</tr></table>
+<div class="meta">
+  <span><b>{tx['search']}:</b> {e(s['query'])}</span>
+  <span><b>{tx['date']}:</b> {s['created_at'].strftime('%Y-%m-%d')}</span>
+  <span><b>{tx['count']}:</b> {len(leads)}</span>
 </div>
+<table>
+<thead><tr><th></th><th>{tx['name']}</th><th>{tx['phone']}</th><th>{tx['address']}</th><th>{tx['rating']}</th></tr></thead>
+<tbody>{rows}</tbody>
+</table>
+<div class="footer">{tx['footer']} {company or 'LeadFinder'} — LeadFinder</div>
+</body></html>"""
 
-<!-- الشاشة الرئيسية -->
-<div id="appScreen" class="hidden">
-  <div class="search-hero">
-    <h2 id="heroTitle"></h2>
-    <div class="sub" id="heroSub"></div>
-    <div class="search-box">
-      <input id="inQuery" type="text" onkeydown="if(event.key==='Enter')runSearch()">
-      <button id="searchBtn" onclick="runSearch()"></button>
-    </div>
-    <div class="filter-row">
-      <label><input type="checkbox" id="strictCity" checked> <span id="strictLbl"></span></label>
-    </div>
-    <div class="chips" id="chips"></div>
-    <div class="usage-bar" id="usageBar"></div>
-  </div>
+    pdf_bytes = HTML(string=doc).write_pdf()
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="leads-{search_id}.pdf"'},
+    )
 
-  <div class="container">
-    <div class="tabs">
-      <button class="tab active" id="tabResults" onclick="showTab('results')"></button>
-      <button class="tab" id="tabPipeline" onclick="showTab('pipeline')"></button>
-      <button class="tab" id="tabHistory" onclick="showTab('history')"></button>
-    </div>
-    <div id="panelResults">
-      <div class="count-bar hidden" id="countBar"><span id="countTxt"></span><div class="bar-actions"><button class="btn-ai" id="aiBtn" onclick="runAnalyze()"></button><button class="btn-pdf" id="pdfBtn" onclick="downloadPDF()"></button></div></div>
-      <div id="resultsList"><div class="status" id="emptyResults"></div></div>
-    </div>
-    <div id="panelPipeline" class="hidden">
-      <div id="followBox"></div>
-      <div class="pipe-stats" id="pipeStats"></div>
-      <div id="pipelineList"></div>
-    </div>
-    <div id="panelHistory" class="hidden">
-      <div id="historyList"><div class="status" id="emptyHistory"></div></div>
-    </div>
-  </div>
-</div>
+# ================== المرحلة 3: التحليل الذكي (Claude Haiku) ==================
+import json
 
-<div class="overlay hidden" id="settingsOverlay">
-  <div class="modal">
-    <h3 id="setTitle"></h3>
-    <div class="field">
-      <label id="setLblName"></label>
-      <input id="setCompany" type="text">
-    </div>
-    <div class="field">
-      <label id="setLblDesc"></label>
-      <textarea id="setDesc"></textarea>
-      <div class="hint" id="setDescHint"></div>
-    </div>
-    <div class="field">
-      <label id="setLblLogo"></label>
-      <input id="setLogo" type="file" accept="image/*" onchange="logoChanged(this)">
-      <img class="logo-preview hidden" id="logoPreview">
-    </div>
-    <div class="modal-actions">
-      <button class="btn-ghost" id="setCancel" onclick="closeSettings()"></button>
-      <button class="btn-main" id="setSave" onclick="saveSettings()"></button>
-    </div>
-  </div>
-</div>
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-<div class="overlay hidden" id="plansOverlay">
-  <div class="modal plans-modal">
-    <h3 id="plansTitle"></h3>
-    <div id="plansGrid"></div>
-    <div class="modal-actions"><button class="btn-ghost" id="plansClose" onclick="closePlans()"></button></div>
-  </div>
-</div>
 
-<div class="overlay hidden" id="adminOverlay">
-  <div class="modal admin-modal">
-    <h3 id="admTitle"></h3>
-    <input id="admSearch" type="text" oninput="renderUsers()" style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:10px;font-size:14px;font-family:inherit">
-    <div id="usersList"></div>
-    <div class="modal-actions">
-      <button class="btn-ghost" id="admCancel" onclick="$('adminOverlay').classList.add('hidden')"></button>
-    </div>
-  </div>
-</div>
+class AnalyzeIn(BaseModel):
+    language: str = "ar"
 
-<div class="toast" id="toast"></div>
 
-<script>
-/* ---------------- النصوص ---------------- */
-const T = {
-  ar: {
-    langBtn:"English", logout:"تسجيل الخروج",
-    loginTitle:"تسجيل الدخول", registerTitle:"إنشاء حساب جديد",
-    loginSub:"ادخل للوصول إلى قوائم عملائك", registerSub:"ابدأ بتوليد عملاء حقيقيين خلال دقيقة",
-    company:"اسم شركتك (يظهر في ملفات PDF لاحقاً)", email:"البريد الإلكتروني", password:"كلمة المرور",
-    loginBtn:"دخول", registerBtn:"إنشاء الحساب",
-    noAccount:"ليس لديك حساب؟", haveAccount:"لديك حساب؟",
-    createOne:"أنشئ حساباً", loginLink:"سجّل الدخول",
-    heroTitle:"اكتب القطاع والمدينة… واحصل على عملاء جاهزين",
-    heroSub:"أرقام حقيقية مع رابط واتساب مباشر لكل شركة",
-    searchPlaceholder:"مثال: عيادات أسنان دبي", searchBtn:"ابحث", searching:"جارٍ البحث…",
-    chips:["عيادات أسنان دبي","مكاتب عقارات الشارقة","مطاعم أبوظبي","صالونات تجميل العين"],
-    tabResults:"النتائج", tabHistory:"سجل البحث",
-    emptyResults:"لا توجد نتائج بعد — ابدأ بحثك الأول من الأعلى",
-    emptyHistory:"لا يوجد سجل بحث بعد",
-    resultsFor:(n,q)=>`${n} عميل محتمل لبحث: «${q}»`,
-    whatsapp:"واتساب", website:"الموقع", maps:"خرائط", noPhone:"لا يوجد رقم منشور",
-    reviews:"تقييم", loading:"جارٍ التحميل…",
-    errNetwork:"تعذر الاتصال بالخادم", done:(n)=>`تم العثور على ${n} عميل محتمل`,
-    settings:"إعدادات الشركة", setTitle:"إعدادات الشركة",
-    setName:"اسم الشركة (يظهر في ملف PDF)", setLogo:"شعار الشركة (يظهر في ملف PDF)",
-    save:"حفظ", cancel:"إلغاء", saved:"تم الحفظ",
-    pdf:"⬇ تحميل PDF", pdfWorking:"جارٍ التوليد…", pdfHint:"أضف اسم شركتك وشعارك من «إعدادات الشركة» ليظهرا في الملف",
-    call:"اتصال", copy:"نسخ", copied:"تم نسخ الرقم", logoTooBig:"الصورة كبيرة — اختر صورة أقل من 1.5MB",
-    strictCity:"نتائج المدينة المكتوبة فقط",
-    setDesc:"وصف نشاطك (للتحليل الذكي)",
-    setDescHint:"مثال: وكالة تسويق رقمي نساعد العيادات والمطاعم على جذب عملاء عبر إعلانات انستقرام وقوقل",
-    ai:"✨ تحليل ذكي", aiWorking:"جارٍ التحليل… (قد يستغرق دقيقة)",
-    aiScore:(s)=>`ملاءمة ${s}/10`, aiDone:"اكتمل التحليل — رُتبت النتائج حسب الملاءمة",
-    aiProgress:(d,tot)=>`جارٍ التحليل… ${d}/${tot}`,
-    msgCopy:"نسخ الرسالة", msgCopied:"تم نسخ الرسالة",
-    tabPipeline:"خط السير",
-    statuses:{new:"جديد", contacted:"تم التواصل", replied:"رد عليّ", interested:"مهتم", meeting:"اجتماع", deal:"صفقة ✅", lost:"غير مناسب"},
-    dealTotal:"قيمة الصفقات", dealPrompt:"قيمة الصفقة بالدرهم (اختياري — اتركها فارغة إن لم تُحدد):",
-    statusSaved:"تم تحديث الحالة",
-    emptyPipeline:"لا يوجد عملاء هنا بعد — غيّر حالة أي عميل من النتائج (أو اضغط واتساب) وسيظهر تلقائياً",
-    needFollowup:(n)=>`⏰ يحتاجون متابعة (${n})`,
-    waitDays:(d)=> d===1?"مر يوم بلا رد":d===2?"مر يومان بلا رد":d<=10?`مرت ${d} أيام بلا رد`:`مر ${d} يوماً بلا رد`,
-    genFollowup:"رسالة متابعة", fuWriting:"جارٍ الكتابة…",
-    fuBumped:"تم — سيعود للتذكير بعد 3 أيام إن لم يرد",
-    planWord:"الخطة", planNames:{free:"المجانية", basic:"الأساسية", pro:"الاحترافية"},
-    usageSearches:"بحث", usageAnalyses:"تحليل ذكي", plansBtn:"الترقية والخطط ↗",
-    plansTitle:"خطط LeadFinder", perMonth:"درهم/شهر", freePrice:"مجاناً",
-    currentPlan:"✓ خطتك الحالية", activateWa:"تفعيل عبر واتساب", contactUs:"تواصل معنا للتفعيل",
-    planFeat:(s,a)=>`${s} عملية بحث شهرياً<br>${a} تحليل ذكي شهرياً<br>PDF + خط سير + متابعات`,
-    close:"إغلاق",
-    waActivateMsg:(plan,email)=>`مرحباً، أرغب بتفعيل الخطة ${plan} لحسابي (${email}) في LeadFinder`,
-    admBtn:"⚡ إدارة العملاء", admTitle:"إدارة العملاء والاشتراكات",
-    admSearchPh:"ابحث ببريد العميل…", admMonthsShort:"شهر",
-    activate:"تفعيل", activated:"تم التفعيل حتى", noUsers:"لا يوجد عملاء مطابقون",
-    admExpired:"منتهي", admLeads:"عميل محتمل", admJoined:"مسجل منذ",
-    accountWord:"الحساب"
-  },
-  en: {
-    langBtn:"عربي", logout:"Log out",
-    loginTitle:"Log in", registerTitle:"Create account",
-    loginSub:"Access your lead lists", registerSub:"Start generating real leads in a minute",
-    company:"Company name (used in PDF exports later)", email:"Email", password:"Password",
-    loginBtn:"Log in", registerBtn:"Create account",
-    noAccount:"No account?", haveAccount:"Have an account?",
-    createOne:"Create one", loginLink:"Log in",
-    heroTitle:"Type a sector and city… get ready-to-contact leads",
-    heroSub:"Real phone numbers with a direct WhatsApp link for every business",
-    searchPlaceholder:"e.g. dental clinics Dubai", searchBtn:"Search", searching:"Searching…",
-    chips:["dental clinics Dubai","real estate offices Sharjah","restaurants Abu Dhabi","beauty salons Al Ain"],
-    tabResults:"Results", tabHistory:"Search history",
-    emptyResults:"No results yet — run your first search above",
-    emptyHistory:"No search history yet",
-    resultsFor:(n,q)=>`${n} leads for: "${q}"`,
-    whatsapp:"WhatsApp", website:"Website", maps:"Maps", noPhone:"No published phone",
-    reviews:"reviews", loading:"Loading…",
-    errNetwork:"Could not reach the server", done:(n)=>`Found ${n} leads`,
-    settings:"Company settings", setTitle:"Company settings",
-    setName:"Company name (shown in PDF)", setLogo:"Company logo (shown in PDF)",
-    save:"Save", cancel:"Cancel", saved:"Saved",
-    pdf:"⬇ Download PDF", pdfWorking:"Generating…", pdfHint:"Add your company name and logo in Company settings to show them in the file",
-    call:"Call", copy:"Copy", copied:"Number copied", logoTooBig:"Image too large — pick one under 1.5MB",
-    strictCity:"Only results in the typed city",
-    setDesc:"Your business description (for AI analysis)",
-    setDescHint:"e.g. Digital marketing agency helping clinics and restaurants get clients via Instagram and Google ads",
-    ai:"✨ AI Analysis", aiWorking:"Analyzing… (may take a minute)",
-    aiScore:(s)=>`Fit ${s}/10`, aiDone:"Analysis complete — results sorted by fit",
-    aiProgress:(d,tot)=>`Analyzing… ${d}/${tot}`,
-    msgCopy:"Copy message", msgCopied:"Message copied",
-    tabPipeline:"Pipeline",
-    statuses:{new:"New", contacted:"Contacted", replied:"Replied", interested:"Interested", meeting:"Meeting", deal:"Deal ✅", lost:"Not a fit"},
-    dealTotal:"Deals value", dealPrompt:"Deal value in AED (optional — leave empty if unknown):",
-    statusSaved:"Status updated",
-    emptyPipeline:"Nothing here yet — set a status on any lead (or tap WhatsApp) and it appears automatically",
-    needFollowup:(n)=>`⏰ Need follow-up (${n})`,
-    waitDays:(d)=>`${d} day${d>1?"s":""} with no reply`,
-    genFollowup:"Follow-up message", fuWriting:"Writing…",
-    fuBumped:"Done — will remind again in 3 days if no reply",
-    planWord:"Plan", planNames:{free:"Free", basic:"Basic", pro:"Pro"},
-    usageSearches:"searches", usageAnalyses:"AI analyses", plansBtn:"Plans & upgrade ↗",
-    plansTitle:"LeadFinder Plans", perMonth:"AED/mo", freePrice:"Free",
-    currentPlan:"✓ Your current plan", activateWa:"Activate via WhatsApp", contactUs:"Contact us to activate",
-    planFeat:(s,a)=>`${s} searches / month<br>${a} AI analyses / month<br>PDF + Pipeline + Follow-ups`,
-    close:"Close",
-    waActivateMsg:(plan,email)=>`Hi, I'd like to activate the ${plan} plan for my LeadFinder account (${email})`,
-    admBtn:"⚡ Customers", admTitle:"Customers & subscriptions",
-    admSearchPh:"Search by email…", admMonthsShort:"mo",
-    activate:"Activate", activated:"Activated until", noUsers:"No matching customers",
-    admExpired:"Expired", admLeads:"leads", admJoined:"joined",
-    accountWord:"Account"
-  }
-};
+@app.post("/api/searches/{search_id}/analyze")
+def analyze_search(search_id: int, data: AnalyzeIn, user_id: int = Depends(get_current_user)):
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(500, "ANTHROPIC_API_KEY غير مضبوط في Railway — أضفه من تبويب Variables")
 
-let lang = localStorage.getItem("lf_lang") || "ar";
-let authMode = "login";
-let token = localStorage.getItem("lf_token") || "";
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT company_name, business_description, plan, plan_expires_at "
+            "FROM users WHERE id=%s", (user_id,))
+        user = cur.fetchone()
+        cur.execute("SELECT query, analyzed_at FROM searches WHERE id=%s AND user_id=%s", (search_id, user_id))
+        s = cur.fetchone()
+        if not s:
+            raise HTTPException(404, "البحث غير موجود")
+        cur.execute(
+            "SELECT id, place_id, name, address, rating, reviews_count, website, ai_score "
+            "FROM leads WHERE user_id=%s AND search_id=%s ORDER BY id",
+            (user_id, search_id),
+        )
+        leads = cur.fetchall()
 
-const $ = id => document.getElementById(id);
-const t = () => T[lang];
+    desc = (user.get("business_description") or "").strip()
+    if not desc:
+        raise HTTPException(400, "أضف وصف نشاطك التجاري في «إعدادات الشركة» أولاً حتى يعرف التحليل ماذا تبيع ولمن")
+    if not leads:
+        raise HTTPException(400, "لا توجد نتائج لتحليلها")
 
-/* ---------------- اللغة ---------------- */
-function applyLang(){
-  document.documentElement.lang = lang;
-  document.documentElement.dir = lang === "ar" ? "rtl" : "ltr";
-  $("langBtn").textContent = t().langBtn;
-  $("logoutBtn").textContent = t().logout;
-  $("settingsBtn").textContent = "⚙ " + t().settings;
-  $("setTitle").textContent = t().setTitle;
-  $("setLblName").textContent = t().setName;
-  $("setLblLogo").textContent = t().setLogo;
-  $("setCancel").textContent = t().cancel;
-  $("setSave").textContent = t().save;
-  $("pdfBtn").textContent = t().pdf;
-  $("strictLbl").textContent = t().strictCity;
-  $("setLblDesc").textContent = t().setDesc;
-  $("setDescHint").textContent = t().setDescHint;
-  $("aiBtn").textContent = t().ai;
-  $("plansTitle").textContent = t().plansTitle;
-  $("plansClose").textContent = t().close;
-  $("adminBtn").textContent = t().admBtn;
-  $("admTitle").textContent = t().admTitle;
-  $("admSearch").placeholder = t().admSearchPh;
-  $("admCancel").textContent = t().cancel;
-  renderUsage();
-  $("lblCompany").textContent = t().company;
-  $("lblEmail").textContent = t().email;
-  $("lblPassword").textContent = t().password;
-  $("heroTitle").textContent = t().heroTitle;
-  $("heroSub").textContent = t().heroSub;
-  $("inQuery").placeholder = t().searchPlaceholder;
-  $("searchBtn").textContent = t().searchBtn;
-  $("tabResults").textContent = t().tabResults;
-  $("tabHistory").textContent = t().tabHistory;
-  $("tabPipeline").textContent = t().tabPipeline;
-  $("emptyResults") && ($("emptyResults").textContent = t().emptyResults);
-  $("emptyHistory") && ($("emptyHistory").textContent = t().emptyHistory);
-  $("chips").innerHTML = t().chips.map(c =>
-    `<button class="chip" onclick="useChip(this)">${c}</button>`).join("");
-  applyAuthMode();
-}
-function toggleLang(){ lang = lang === "ar" ? "en" : "ar"; localStorage.setItem("lf_lang", lang); applyLang(); }
-function useChip(el){ $("inQuery").value = el.textContent; runSearch(); }
+    total = len(leads)
+    # نحلل فقط غير المحلل — طلب واحد = 10 شركات (سريع وآمن من انقطاع الاتصال)
+    pending = [l for l in leads if l.get("ai_score") is None][:10]
+    if not pending:
+        return {"remaining": 0, "total": total}
 
-/* ---------------- المصادقة ---------------- */
-function applyAuthMode(){
-  const login = authMode === "login";
-  $("authTitle").textContent = login ? t().loginTitle : t().registerTitle;
-  $("authSub").textContent = login ? t().loginSub : t().registerSub;
-  $("authBtn").textContent = login ? t().loginBtn : t().registerBtn;
-  $("switchTxt").textContent = login ? t().noAccount : t().haveAccount;
-  $("switchLink").textContent = login ? t().createOne : t().loginLink;
-  $("companyField").classList.toggle("hidden", login);
-}
-function toggleAuthMode(){ authMode = authMode === "login" ? "register" : "login"; applyAuthMode(); }
+    # فرض حد التحليل الشهري (يُحتسب مرة واحدة لكل بحث مهما بلغت دفعاته)
+    if not s.get("analyzed_at"):
+        with get_db() as conn:
+            cur = conn.cursor()
+            _, a_used = get_usage(cur, user_id)
+        if a_used >= PLANS[effective_plan(user)]["analyses"]:
+            raise HTTPException(402, "استنفدت حصة التحليل الذكي لهذا الشهر — رقِّ خطتك للمواصلة")
 
-async function submitAuth(){
-  const btn = $("authBtn"); btn.disabled = true;
-  try{
-    const path = authMode === "login" ? "/api/login" : "/api/register";
-    const body = { email:$("inEmail").value, password:$("inPassword").value };
-    if(authMode === "register") body.company_name = $("inCompany").value;
-    const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
-    const d = await r.json();
-    if(!r.ok) throw new Error(d.detail || t().errNetwork);
-    token = d.token;
-    localStorage.setItem("lf_token", token);
-    showApp();
-  }catch(e){ toast(e.message, true); }
-  btn.disabled = false;
-}
-function logout(){ token=""; localStorage.removeItem("lf_token"); location.reload(); }
+    lang_name = "العربية" if data.language == "ar" else "English"
 
-/* ---------------- الشاشات ---------------- */
-function showApp(){
-  $("authScreen").classList.add("hidden");
-  $("appScreen").classList.remove("hidden");
-  $("logoutBtn").classList.remove("hidden");
-  $("settingsBtn").classList.remove("hidden");
-  loadCompany();
-  loadUsage();
-  loadHistory();
-}
-function showTab(name){
-  $("tabResults").classList.toggle("active", name==="results");
-  $("tabHistory").classList.toggle("active", name==="history");
-  $("tabPipeline").classList.toggle("active", name==="pipeline");
-  $("panelResults").classList.toggle("hidden", name!=="results");
-  $("panelHistory").classList.toggle("hidden", name!=="history");
-  $("panelPipeline").classList.toggle("hidden", name!=="pipeline");
-  if(name==="history") loadHistory();
-  if(name==="pipeline") loadPipeline();
-}
+    leads_json = json.dumps([{
+        "place_id": l["place_id"],
+        "name": l["name"],
+        "address": l["address"],
+        "rating": l["rating"],
+        "reviews": l["reviews_count"],
+        "has_website": bool(l["website"]),
+    } for l in pending], ensure_ascii=False)
 
-/* ---------------- الطلبات ---------------- */
-async function api(path, opts={}){
-  const r = await fetch(path, {...opts, headers:{
-    "Content-Type":"application/json",
-    "Authorization":"Bearer "+token,
-    ...(opts.headers||{})
-  }});
-  if(r.status === 401){ logout(); return; }
-  const d = await r.json();
-  if(!r.ok){
-    const err = new Error(d.detail || t().errNetwork);
-    err.status = r.status;
-    throw err;
-  }
-  return d;
-}
+    prompt = f"""أنت محلل مبيعات خبير. مستخدم اسمه/شركته: «{user['company_name'] or 'غير محدد'}».
+وصف نشاطه وما يبيعه: «{desc}»
+بحث عن عملاء محتملين بكلمات: «{s['query']}» وحصل على قائمة الشركات أدناه.
 
-/* ---------------- البحث ---------------- */
-async function runSearch(){
-  const q = $("inQuery").value.trim();
-  if(!q) return;
-  const btn = $("searchBtn");
-  btn.disabled = true; btn.textContent = t().searching;
-  showTab("results");
-  $("resultsList").innerHTML = `<div class="status">${t().searching}</div>`;
-  $("countBar").classList.add("hidden");
-  try{
-    const d = await api("/api/search", {method:"POST", body:JSON.stringify({query:q, language:lang, strict_city:$("strictCity").checked})});
-    lastSearchId = d.search_id; lastQuery = q;
-    renderLeads(d.leads, q);
-    toast(t().done(d.count));
-  }catch(e){
-    $("resultsList").innerHTML = `<div class="status">${e.message}</div>`;
-    toast(e.message, true);
-    if(e.status === 402) openPlans();
-  }
-  btn.disabled = false; btn.textContent = t().searchBtn;
-  loadUsage();
-}
+لكل شركة قيّم مدى ملاءمتها كعميل محتمل لهذا النشاط تحديداً، واكتب:
+- score: رقم من 1 إلى 10 (10 = عميل مثالي جداً)
+- reason: سبب التقييم في جملة واحدة بلغة {lang_name}
+- message: رسالة واتساب افتتاحية موجهة لهذه الشركة بالاسم، بلغة {lang_name}، ودية ومهنية بلا مبالغة تسويقية، 2-3 جمل قصيرة، تنتهي بسؤال بسيط يفتح الحوار. لا تذكر أنك وجدتهم عبر بحث.
 
-function esc(s){ return (s||"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+الشركات:
+{leads_json}
 
-function statusSelect(l){
-  const st = l.status || "new";
-  const opts = Object.entries(t().statuses).map(([k,v]) =>
-    `<option value="${k}" ${k===st?"selected":""}>${v}</option>`).join("");
-  return `<select class="status-sel st-${st}" onchange="setStatus(${l.id}, this)">${opts}</select>`;
-}
+أعد فقط JSON بهذا الشكل بدون أي نص قبله أو بعده وبدون علامات تنسيق:
+[{{"place_id": "...", "score": 8, "reason": "...", "message": "..."}}]"""
 
-function leadCard(l){
-  return `
-    <div class="lead">
-      <div class="lead-info">
-        <div class="lead-name">${esc(l.name)} ${l.ai_score ? `<span class="ai-badge">${t().aiScore(l.ai_score)}</span>` : ""}</div>
-        <div class="lead-addr">${esc(l.address)}</div>
-        <div class="lead-meta">
-          ${l.rating ? `<span class="rating">★ ${l.rating}</span><span>(${l.reviews_count||0} ${t().reviews})</span>` : ""}
-          ${l.phone ? `<span class="lead-phone">${esc(l.phone)}</span>` : ""}
-          ${l.deal_value ? `<span class="deal-val">💰 ${Number(l.deal_value).toLocaleString()} AED</span>` : ""}
-        </div>
-        <div class="lead-meta" style="margin-top:8px">
-          ${l.id ? statusSelect(l) : ""}
-          ${l.phone ? `<a class="btn-mini" href="tel:${esc(l.phone).replace(/\s/g,'')}">📞 ${t().call}</a>
-          <button class="btn-mini" onclick="copyPhone('${esc(l.phone)}')">📋 ${t().copy}</button>` : ""}
-          ${l.ai_message ? `<button class="btn-mini" data-msg="${esc(l.ai_message)}" onclick="copyMsg(this)">💬 ${t().msgCopy}</button>` : ""}
-        </div>
-        ${l.ai_reason ? `<div class="ai-reason">${esc(l.ai_reason)}</div>` : ""}
-      </div>
-      <div class="lead-actions">
-        ${l.whatsapp
-          ? `<a class="btn-wa" href="${esc(l.whatsapp)}${l.ai_message ? '?text='+encodeURIComponent(l.ai_message) : ''}" target="_blank" rel="noopener" onclick="waClicked(this, ${l.id||0})">💬 ${t().whatsapp}</a>`
-          : `<span class="no-wa">${t().noPhone}</span>`}
-        ${l.website ? `<a class="btn-sec" href="${esc(l.website)}" target="_blank" rel="noopener">${t().website}</a>` : ""}
-        ${l.maps_url ? `<a class="btn-sec" href="${esc(l.maps_url)}" target="_blank" rel="noopener">${t().maps}</a>` : ""}
-      </div>
-    </div>`;
-}
+    try:
+        resp = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5",
+                "max_tokens": 4000,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=90,
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"تعذر الاتصال بخدمة التحليل ({repr(exc)[:150]}) — أعد الضغط للاستئناف")
 
-function renderLeads(leads, query){
-  if(!leads.length){
-    $("resultsList").innerHTML = `<div class="status">${t().emptyResults}</div>`;
-    return;
-  }
-  $("countBar").classList.remove("hidden");
-  $("countTxt").textContent = t().resultsFor(leads.length, query);
-  $("resultsList").innerHTML = leads.map(leadCard).join("");
-}
+    if resp.status_code != 200:
+        raise HTTPException(502, f"خطأ من خدمة التحليل: {resp.text[:300]}")
 
-/* ---------------- خط السير ---------------- */
-let pipeData = null, pipeFilter = "";
+    text = "".join(b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text")
+    m = re.search(r"\[[\s\S]*\]", re.sub(r"```json|```", "", text))
+    try:
+        items = json.loads(m.group(0)) if m else []
+    except Exception:
+        items = []
+    if not items:
+        raise HTTPException(502, "تعذر قراءة نتيجة التحليل — أعد الضغط على الزر للاستئناف")
 
-async function loadPipeline(){
-  $("pipelineList").innerHTML = `<div class="status">${t().loading}</div>`;
-  try{
-    pipeData = await api("/api/pipeline");
-    renderPipeline();
-  }catch(e){ $("pipelineList").innerHTML = `<div class="status">${e.message}</div>`; }
-}
+    with get_db() as conn:
+        cur = conn.cursor()
+        for it in items:
+            cur.execute(
+                "UPDATE leads SET ai_score=%s, ai_reason=%s, ai_message=%s "
+                "WHERE user_id=%s AND search_id=%s AND place_id=%s",
+                (it.get("score"), it.get("reason", ""), it.get("message", ""),
+                 user_id, search_id, it.get("place_id", "")),
+            )
+        cur.execute(
+            "UPDATE searches SET analyzed_at=COALESCE(analyzed_at, NOW()) WHERE id=%s AND user_id=%s",
+            (search_id, user_id),
+        )
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM leads WHERE user_id=%s AND search_id=%s AND ai_score IS NULL",
+            (user_id, search_id),
+        )
+        remaining = cur.fetchone()["c"]
 
-function renderPipeline(){
-  const fus = pipeData.followups || [];
-  $("followBox").innerHTML = fus.length
-    ? `<div class="fu-head">${t().needFollowup(fus.length)}</div>` + fus.map(followCard).join("")
-    : "";
-  const st = pipeData.stats || {};
-  const order = ["contacted","replied","interested","meeting","deal","lost"];
-  $("pipeStats").innerHTML = order.map(k => {
-    const c = (st[k] && st[k].count) || 0;
-    return `<button class="pipe-stat st-${k} ${pipeFilter===k?"active":""}" onclick="setPipeFilter('${k}')">${t().statuses[k]}: ${c}</button>`;
-  }).join("") + `<span class="pipe-total">💰 ${t().dealTotal}: ${Number(pipeData.deal_total||0).toLocaleString()} AED</span>`;
-  const leads = (pipeData.leads||[]).filter(l => !pipeFilter || l.status===pipeFilter);
-  $("pipelineList").innerHTML = leads.length ? leads.map(leadCard).join("") : `<div class="status">${t().emptyPipeline}</div>`;
-}
+    return {"remaining": remaining, "total": total}
 
-function setPipeFilter(k){ pipeFilter = pipeFilter===k ? "" : k; renderPipeline(); }
 
-function followCard(l){
-  return `
-    <div class="lead follow">
-      <div class="lead-info">
-        <div class="lead-name">${esc(l.name)} <span class="wait-badge">${t().waitDays(l.days_waiting||3)}</span></div>
-        <div class="lead-addr">${esc(l.address)}</div>
-        <div class="lead-meta" style="margin-top:8px" id="fu-${l.id}">
-          <button class="btn-mini btn-fu" onclick="genFollowup(${l.id}, this)">✨ ${t().genFollowup}</button>
-          ${l.phone ? `<span class="lead-phone">${esc(l.phone)}</span>` : ""}
-        </div>
-      </div>
-    </div>`;
-}
+# ================== المرحلة 5: خط سير العميل ==================
+ALLOWED_STATUSES = {"new", "contacted", "replied", "interested", "meeting", "deal", "lost"}
 
-async function genFollowup(id, btn){
-  btn.disabled = true; btn.textContent = t().fuWriting;
-  try{
-    const d = await api(`/api/leads/${id}/followup`, {method:"POST", body:JSON.stringify({language:lang})});
-    const l = (pipeData.followups||[]).find(x=>x.id===id) || {};
-    const wa = l.whatsapp ? `${esc(l.whatsapp)}?text=${encodeURIComponent(d.message)}` : "";
-    $(`fu-${id}`).innerHTML = `
-      <div style="width:100%">
-        <div class="fu-msg">${esc(d.message)}</div>
-        <div class="lead-meta" style="margin-top:8px">
-          ${wa ? `<a class="btn-wa" href="${wa}" target="_blank" rel="noopener" onclick="fuSent(${id}, this)">💬 ${t().whatsapp}</a>` : ""}
-          <button class="btn-mini" data-msg="${esc(d.message)}" onclick="copyMsg(this)">📋 ${t().msgCopy}</button>
-        </div>
-      </div>`;
-  }catch(e){
-    toast(e.message, true);
-    btn.disabled = false; btn.textContent = "✨ " + t().genFollowup;
-  }
-}
 
-function fuSent(id, el){
-  api(`/api/leads/${id}/status`, {method:"POST", body:JSON.stringify({status:"contacted"})}).catch(()=>{});
-  const card = el.closest(".lead");
-  if(card) setTimeout(()=> card.remove(), 400);
-  toast(t().fuBumped);
-}
+class StatusIn(BaseModel):
+    status: str
+    deal_value: float | None = None
 
-async function setStatus(id, sel){
-  const status = sel.value;
-  let deal_value = null;
-  if(status === "deal"){
-    const v = prompt(t().dealPrompt, "");
-    if(v !== null && v.trim() !== "" && !isNaN(parseFloat(v))) deal_value = parseFloat(v);
-  }
-  try{
-    await api(`/api/leads/${id}/status`, {method:"POST", body:JSON.stringify({status, deal_value})});
-    sel.className = "status-sel st-" + status;
-    toast(t().statusSaved);
-    if(!$("panelPipeline").classList.contains("hidden")) loadPipeline();
-  }catch(e){ toast(e.message, true); }
-}
 
-function waClicked(el, id){
-  if(!id) return;
-  const sel = el.closest(".lead").querySelector(".status-sel");
-  if(sel && sel.value === "new"){
-    api(`/api/leads/${id}/status`, {method:"POST", body:JSON.stringify({status:"contacted"})}).catch(()=>{});
-    sel.value = "contacted";
-    sel.className = "status-sel st-contacted";
-  }
-}
+@app.post("/api/leads/{lead_id}/status")
+def set_lead_status(lead_id: int, data: StatusIn, user_id: int = Depends(get_current_user)):
+    if data.status not in ALLOWED_STATUSES:
+        raise HTTPException(400, "حالة غير معروفة")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE leads SET
+                 status = %s,
+                 status_updated_at = NOW(),
+                 contacted_at = CASE WHEN contacted_at IS NULL AND %s <> 'new'
+                                     THEN NOW() ELSE contacted_at END,
+                 deal_value = COALESCE(%s, deal_value)
+               WHERE id = %s AND user_id = %s RETURNING id""",
+            (data.status, data.status, data.deal_value, lead_id, user_id),
+        )
+        if not cur.fetchone():
+            raise HTTPException(404, "العميل غير موجود")
+    return {"ok": True}
 
-/* ---------------- السجل ---------------- */
-async function loadHistory(){
-  try{
-    const items = await api("/api/searches");
-    if(!items || !items.length){
-      $("historyList").innerHTML = `<div class="status">${t().emptyHistory}</div>`;
-      return;
+
+@app.get("/api/pipeline")
+def pipeline(user_id: int = Depends(get_current_user)):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COALESCE(status,'new') AS status, COUNT(*) AS c, "
+            "COALESCE(SUM(deal_value),0) AS v "
+            "FROM leads WHERE user_id=%s GROUP BY COALESCE(status,'new')",
+            (user_id,),
+        )
+        stats = {r["status"]: {"count": r["c"], "value": float(r["v"])} for r in cur.fetchall()}
+        cur.execute(
+            "SELECT * FROM leads WHERE user_id=%s AND COALESCE(status,'new') <> 'new' "
+            "ORDER BY status_updated_at DESC NULLS LAST LIMIT 500",
+            (user_id,),
+        )
+        rows = cur.fetchall()
+        cur.execute(
+            "SELECT *, GREATEST(1, EXTRACT(DAY FROM NOW() - status_updated_at))::int AS days_waiting "
+            "FROM leads WHERE user_id=%s AND status='contacted' "
+            "AND status_updated_at <= NOW() - INTERVAL '3 days' "
+            "ORDER BY status_updated_at ASC LIMIT 100",
+            (user_id,),
+        )
+        followups = cur.fetchall()
+    deal_total = stats.get("deal", {}).get("value", 0)
+    return {"stats": stats, "deal_total": deal_total, "leads": rows, "followups": followups}
+
+
+# ================== تذكير المتابعة الذكي ==================
+class FollowupIn(BaseModel):
+    language: str = "ar"
+
+
+@app.post("/api/leads/{lead_id}/followup")
+def gen_followup(lead_id: int, data: FollowupIn, user_id: int = Depends(get_current_user)):
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(500, "ANTHROPIC_API_KEY غير مضبوط في Railway")
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT company_name, business_description FROM users WHERE id=%s", (user_id,))
+        user = cur.fetchone()
+        cur.execute("SELECT * FROM leads WHERE id=%s AND user_id=%s", (lead_id, user_id))
+        lead = cur.fetchone()
+    if not lead:
+        raise HTTPException(404, "العميل غير موجود")
+
+    # إعادة استخدام الرسالة إن كانت مولدة بعد آخر تحديث حالة (توفير تكلفة)
+    if (lead.get("followup_message")
+            and lead.get("followup_generated_at")
+            and lead.get("status_updated_at")
+            and lead["followup_generated_at"] > lead["status_updated_at"]):
+        return {"message": lead["followup_message"]}
+
+    days = 3
+    if lead.get("status_updated_at"):
+        days = max(1, (datetime.datetime.now(lead["status_updated_at"].tzinfo)
+                       - lead["status_updated_at"]).days)
+
+    lang_name = "العربية" if data.language == "ar" else "English"
+    first_msg = lead.get("ai_message") or "(لا توجد — كانت رسالة عامة)"
+
+    prompt = f"""أنت مساعد مبيعات محترف. صاحب نشاط: «{user['company_name'] or 'غير محدد'}» — {user.get('business_description') or ''}
+راسل شركة «{lead['name']}» عبر واتساب ولم يصله رد منذ {days} أيام.
+الرسالة الأولى كانت: «{first_msg}»
+
+اكتب رسالة متابعة بلغة {lang_name}: جملتان قصيرتان فقط، بأسلوب مختلف تماماً عن الرسالة الأولى — خفيفة وغير ملحّة، لا تعاتب على عدم الرد ولا تقول "للتذكير"، تضيف زاوية أو فائدة جديدة، وتنتهي بسؤال يسهل الرد عليه بكلمة واحدة.
+
+أعد نص الرسالة فقط بدون أي مقدمات أو علامات."""
+
+    try:
+        resp = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5",
+                "max_tokens": 300,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=60,
+        )
+    except Exception:
+        raise HTTPException(502, "تعذر الاتصال بخدمة التحليل — أعد المحاولة")
+    if resp.status_code != 200:
+        raise HTTPException(502, f"خطأ من خدمة التحليل: {resp.text[:300]}")
+
+    text = "".join(b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text").strip()
+    if not text:
+        raise HTTPException(502, "تعذرت كتابة الرسالة — أعد المحاولة")
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE leads SET followup_message=%s, followup_generated_at=NOW() WHERE id=%s AND user_id=%s",
+            (text, lead_id, user_id),
+        )
+    return {"message": text}
+
+
+# ================== الاستخدام والخطط ==================
+@app.get("/api/usage")
+def usage(user_id: int = Depends(get_current_user)):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, email, plan, plan_expires_at FROM users WHERE id=%s", (user_id,))
+        user = cur.fetchone()
+        s_used, a_used = get_usage(cur, user_id)
+    plan = effective_plan(user)
+    p = PLANS[plan]
+    return {
+        "email": user["email"],
+        "plan": plan,
+        "expires": user.get("plan_expires_at"),
+        "searches_used": s_used, "searches_limit": p["searches"],
+        "analyses_used": a_used, "analyses_limit": p["analyses"],
+        "is_admin": is_admin_user(user),
+        "support_whatsapp": SUPPORT_WHATSAPP,
+        "plans": PLANS,
     }
-    $("historyList").innerHTML = items.map(s => `
-      <div class="hist" onclick="openSearch(${s.id}, '${esc(s.query).replace(/'/g,"\\'")}')">
-        <div>
-          <div class="q">${esc(s.query)}</div>
-          <div class="m">${new Date(s.created_at).toLocaleString(lang==="ar"?"ar-AE":"en-GB")}</div>
-        </div>
-        <span class="n">${s.results_count}</span>
-      </div>`).join("");
-  }catch(e){ /* تجاهل */ }
-}
 
-async function openSearch(id, query){
-  showTab("results");
-  $("resultsList").innerHTML = `<div class="status">${t().loading}</div>`;
-  try{
-    const leads = await api(`/api/searches/${id}/leads`);
-    lastSearchId = id; lastQuery = query;
-    renderLeads(leads, query);
-  }catch(e){ toast(e.message, true); }
-}
 
-/* ---------------- الشركة وPDF والنسخ ---------------- */
-let lastSearchId = null;
-let lastQuery = "";
+class ActivateIn(BaseModel):
+    email: str
+    plan: str
+    months: int = 1
 
-async function runAnalyze(){
-  if(!lastSearchId) return;
-  const btn = $("aiBtn");
-  btn.disabled = true; btn.textContent = t().aiWorking;
-  try{
-    let remaining = 1, total = 0, guard = 0;
-    while(remaining > 0 && guard < 15){
-      const d = await api(`/api/searches/${lastSearchId}/analyze`,
-        {method:"POST", body:JSON.stringify({language:lang})});
-      remaining = d.remaining; total = d.total;
-      btn.textContent = t().aiProgress(total - remaining, total);
-      guard++;
-    }
-    const leads = await api(`/api/searches/${lastSearchId}/leads`);
-    renderLeads(leads, lastQuery);
-    toast(t().aiDone);
-  }catch(e){
-    toast(e.message, true);
-    if(e.status === 402) openPlans();
-  }
-  btn.disabled = false; btn.textContent = t().ai;
-  loadUsage();
-}
-function copyMsg(btn){
-  navigator.clipboard.writeText(btn.dataset.msg).then(()=>toast(t().msgCopied)).catch(()=>{});
-}
-let companyData = {company_name:"", logo_base64:""};
 
-async function loadCompany(){
-  try{ companyData = await api("/api/company"); }catch(e){}
-}
-function openSettings(){
-  $("setCompany").value = companyData.company_name || "";
-  $("setDesc").value = companyData.business_description || "";
-  const p = $("logoPreview");
-  if(companyData.logo_base64){ p.src = companyData.logo_base64; p.classList.remove("hidden"); }
-  else p.classList.add("hidden");
-  $("settingsOverlay").classList.remove("hidden");
-}
-function closeSettings(){ $("settingsOverlay").classList.add("hidden"); }
-function logoChanged(input){
-  const f = input.files[0];
-  if(!f) return;
-  if(f.size > 1_500_000){ toast(t().logoTooBig, true); input.value=""; return; }
-  const r = new FileReader();
-  r.onload = () => {
-    companyData.logo_base64 = r.result;
-    $("logoPreview").src = r.result;
-    $("logoPreview").classList.remove("hidden");
-  };
-  r.readAsDataURL(f);
-}
-async function saveSettings(){
-  try{
-    companyData.company_name = $("setCompany").value;
-    companyData.business_description = $("setDesc").value;
-    await api("/api/company", {method:"POST", body:JSON.stringify(companyData)});
-    toast(t().saved);
-    closeSettings();
-  }catch(e){ toast(e.message, true); }
-}
-async function downloadPDF(){
-  if(!lastSearchId) return;
-  const btn = $("pdfBtn");
-  btn.disabled = true; btn.textContent = t().pdfWorking;
-  try{
-    if(!companyData.company_name && !companyData.logo_base64) toast(t().pdfHint);
-    const r = await fetch(`/api/searches/${lastSearchId}/pdf?lang=${lang}`,
-      {headers:{Authorization:"Bearer "+token}});
-    if(!r.ok){ const d = await r.json().catch(()=>({})); throw new Error(d.detail || t().errNetwork); }
-    const blob = await r.blob();
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `leads-${lastSearchId}.pdf`;
-    a.click();
-    URL.revokeObjectURL(a.href);
-  }catch(e){ toast(e.message, true); }
-  btn.disabled = false; btn.textContent = t().pdf;
-}
-function copyPhone(p){
-  navigator.clipboard.writeText(p).then(()=>toast(t().copied)).catch(()=>{});
-}
+@app.post("/api/admin/activate")
+def admin_activate(data: ActivateIn, user_id: int = Depends(get_current_user)):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, email FROM users WHERE id=%s", (user_id,))
+        me = cur.fetchone()
+    if not is_admin_user(me):
+        raise HTTPException(403, "غير مصرح — هذه اللوحة للمشرف فقط")
+    if data.plan not in PLANS:
+        raise HTTPException(400, "خطة غير معروفة")
+    months = max(1, min(24, data.months))
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET plan=%s, "
+            "plan_expires_at = CASE WHEN %s='free' THEN NULL ELSE NOW() + (%s || ' days')::interval END "
+            "WHERE email=%s RETURNING email, plan, plan_expires_at",
+            (data.plan, data.plan, months * 30, data.email.strip().lower()),
+        )
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "لا يوجد مستخدم مسجل بهذا البريد")
+    return row
 
-/* ---------------- الاستخدام والخطط ---------------- */
-let usageData = null;
 
-async function loadUsage(){
-  try{
-    usageData = await api("/api/usage");
-    renderUsage();
-    if(usageData.is_admin) $("adminBtn").classList.remove("hidden");
-  }catch(e){}
-}
+@app.get("/api/admin/users")
+def admin_users(user_id: int = Depends(get_current_user)):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, email FROM users WHERE id=%s", (user_id,))
+        me = cur.fetchone()
+        if not is_admin_user(me):
+            raise HTTPException(403, "غير مصرح — هذه اللوحة للمشرف فقط")
+        cur.execute("""
+            SELECT u.id, u.email, u.company_name,
+                   COALESCE(u.plan,'free') AS plan, u.plan_expires_at, u.created_at,
+                   (SELECT COUNT(*) FROM searches s
+                      WHERE s.user_id = u.id
+                        AND s.created_at >= date_trunc('month', NOW())) AS searches_used,
+                   (SELECT COUNT(*) FROM leads l WHERE l.user_id = u.id) AS leads_count
+            FROM users u ORDER BY u.id DESC LIMIT 300
+        """)
+        rows = cur.fetchall()
 
-function renderUsage(){
-  if(!usageData){ $("usageBar").innerHTML = ""; return; }
-  const u = usageData;
-  $("usageBar").innerHTML =
-    `<span dir="ltr">${esc(u.email||"")}</span> · ` +
-    `${t().planWord}: <b>${t().planNames[u.plan]}</b> · ` +
-    `${t().usageSearches} ${u.searches_used}/${u.searches_limit} · ` +
-    `${t().usageAnalyses} ${u.analyses_used}/${u.analyses_limit}` +
-    `<button class="link-btn" onclick="openPlans()">${t().plansBtn}</button>`;
-}
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for r in rows:
+        exp = r.get("plan_expires_at")
+        r["active"] = bool(r["plan"] != "free" and exp and exp > now)
+    return rows
 
-function openPlans(){
-  if(!usageData) return;
-  const P = usageData.plans, cur = usageData.plan;
-  $("plansGrid").innerHTML = ["free","basic","pro"].map(k=>{
-    const p = P[k], isCur = k===cur;
-    const waMsg = encodeURIComponent(t().waActivateMsg(t().planNames[k], usageData.email||""));
-    let btn = "";
-    if(isCur) btn = `<div class="plan-cur">${t().currentPlan}</div>`;
-    else if(k !== "free")
-      btn = usageData.support_whatsapp
-        ? `<a class="btn-wa" style="justify-content:center;width:100%" href="https://wa.me/${usageData.support_whatsapp}?text=${waMsg}" target="_blank" rel="noopener">💬 ${t().activateWa}</a>`
-        : `<div class="plan-cur">${t().contactUs}</div>`;
-    return `<div class="plan-card ${isCur?"current":""}">
-      <div class="plan-name">${t().planNames[k]}</div>
-      <div class="plan-price">${p.price ? p.price + " " + t().perMonth : t().freePrice}</div>
-      <div class="plan-feat">${t().planFeat(p.searches, p.analyses)}</div>
-      ${btn}</div>`;
-  }).join("");
-  $("plansOverlay").classList.remove("hidden");
-}
-function closePlans(){ $("plansOverlay").classList.add("hidden"); }
 
-let usersData = [];
+# ================== إدارة الحساب (البريد وكلمة المرور) ==================
+class ChangeEmailIn(BaseModel):
+    new_email: str
+    password: str
 
-async function openAdmin(){
-  $("adminOverlay").classList.remove("hidden");
-  $("usersList").innerHTML = `<div class="status">${t().loading}</div>`;
-  try{
-    usersData = await api("/api/admin/users");
-    renderUsers();
-  }catch(e){ $("usersList").innerHTML = `<div class="status">${e.message}</div>`; }
-}
 
-function planBadge(u){
-  if(u.plan === "free") return `<span class="badge-plan bp-free">${t().planNames.free}</span>`;
-  const cls = u.active ? (u.plan === "pro" ? "bp-pro" : "bp-basic") : "bp-exp";
-  const label = u.active
-    ? `${t().planNames[u.plan]} · ${new Date(u.plan_expires_at).toLocaleDateString(lang==="ar"?"ar-AE":"en-GB")}`
-    : `${t().planNames[u.plan]} · ${t().admExpired}`;
-  return `<span class="badge-plan ${cls}">${label}</span>`;
-}
+class ChangePasswordIn(BaseModel):
+    current_password: str
+    new_password: str
 
-function renderUsers(){
-  const q = ($("admSearch").value || "").trim().toLowerCase();
-  const list = usersData.filter(u => !q || (u.email||"").toLowerCase().includes(q));
-  if(!list.length){ $("usersList").innerHTML = `<div class="status">${t().noUsers}</div>`; return; }
-  $("usersList").innerHTML = list.map(u => `
-    <div class="usr">
-      <div class="usr-top">
-        <div>
-          <div class="usr-mail">${esc(u.email)}</div>
-          <div class="usr-meta">${esc(u.company_name||"—")} · ${u.searches_used} ${t().usageSearches} · ${u.leads_count} ${t().admLeads} · ${t().admJoined} ${new Date(u.created_at).toLocaleDateString(lang==="ar"?"ar-AE":"en-GB")}</div>
-        </div>
-        ${planBadge(u)}
-      </div>
-      <div class="usr-ctl">
-        <select id="up-${u.id}">
-          <option value="basic">${t().planNames.basic} — 99</option>
-          <option value="pro">${t().planNames.pro} — 199</option>
-          <option value="free">${t().planNames.free}</option>
-        </select>
-        <input id="um-${u.id}" type="number" value="1" min="1" max="24" title="${t().admMonthsShort}">
-        <span class="usr-meta">${t().admMonthsShort}</span>
-        <button class="btn-act" onclick="activateUser('${esc(u.email)}', ${u.id}, this)">${t().activate}</button>
-      </div>
-    </div>`).join("");
-}
 
-async function activateUser(email, id, btn){
-  btn.disabled = true;
-  try{
-    const d = await api("/api/admin/activate", {method:"POST", body:JSON.stringify({
-      email: email,
-      plan: $(`up-${id}`).value,
-      months: parseInt($(`um-${id}`).value) || 1
-    })});
-    toast(t().activated + " " + (d.plan_expires_at ? new Date(d.plan_expires_at).toLocaleDateString(lang==="ar"?"ar-AE":"en-GB") : "∞"));
-    usersData = await api("/api/admin/users");
-    renderUsers();
-    loadUsage();
-  }catch(e){ toast(e.message, true); }
-  btn.disabled = false;
-}
+def _verify_own_password(user_id: int, password: str):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT password_hash FROM users WHERE id=%s", (user_id,))
+        row = cur.fetchone()
+    if not row or not verify_password(password, row["password_hash"]):
+        raise HTTPException(401, "كلمة المرور الحالية غير صحيحة")
 
-/* ---------------- إشعارات ---------------- */
-let toastTimer;
-function toast(msg, err=false){
-  const el = $("toast");
-  el.textContent = msg;
-  el.className = "toast show" + (err ? " err" : "");
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(()=> el.className = "toast", 3000);
-}
 
-/* ---------------- البداية ---------------- */
-applyLang();
-if(token) showApp();
-</script>
-</body>
-</html>
+@app.post("/api/account/email")
+def change_email(data: ChangeEmailIn, user_id: int = Depends(get_current_user)):
+    new_email = data.new_email.strip().lower()
+    if "@" not in new_email or len(new_email) < 5:
+        raise HTTPException(400, "بريد إلكتروني غير صالح")
+    _verify_own_password(user_id, data.password)
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM users WHERE email=%s AND id<>%s", (new_email, user_id))
+        if cur.fetchone():
+            raise HTTPException(400, "هذا البريد مستخدم في حساب آخر")
+        cur.execute("UPDATE users SET email=%s WHERE id=%s", (new_email, user_id))
+    return {"ok": True, "email": new_email}
+
+
+@app.post("/api/account/password")
+def change_password(data: ChangePasswordIn, user_id: int = Depends(get_current_user)):
+    if len(data.new_password) < 6:
+        raise HTTPException(400, "كلمة المرور الجديدة يجب أن تكون 6 أحرف على الأقل")
+    _verify_own_password(user_id, data.current_password)
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET password_hash=%s WHERE id=%s",
+                    (hash_password(data.new_password), user_id))
+    return {"ok": True}
