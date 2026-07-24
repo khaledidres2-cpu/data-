@@ -47,6 +47,14 @@ ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()
 SUPPORT_WHATSAPP = re.sub(r"\D", "", os.environ.get("SUPPORT_WHATSAPP", ""))
 
 
+def is_admin_user(user) -> bool:
+    """أدمن إذا طابق ADMIN_EMAIL، أو كان أول حساب مسجل في النظام (المالك)."""
+    email = (user.get("email") or "").strip().lower()
+    if ADMIN_EMAIL and email == ADMIN_EMAIL:
+        return True
+    return user.get("id") == 1
+
+
 def effective_plan(user) -> str:
     plan = user.get("plan") or "free"
     if plan not in PLANS:
@@ -816,7 +824,7 @@ def gen_followup(lead_id: int, data: FollowupIn, user_id: int = Depends(get_curr
 def usage(user_id: int = Depends(get_current_user)):
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT email, plan, plan_expires_at FROM users WHERE id=%s", (user_id,))
+        cur.execute("SELECT id, email, plan, plan_expires_at FROM users WHERE id=%s", (user_id,))
         user = cur.fetchone()
         s_used, a_used = get_usage(cur, user_id)
     plan = effective_plan(user)
@@ -827,7 +835,7 @@ def usage(user_id: int = Depends(get_current_user)):
         "expires": user.get("plan_expires_at"),
         "searches_used": s_used, "searches_limit": p["searches"],
         "analyses_used": a_used, "analyses_limit": p["analyses"],
-        "is_admin": bool(ADMIN_EMAIL) and user["email"] == ADMIN_EMAIL,
+        "is_admin": is_admin_user(user),
         "support_whatsapp": SUPPORT_WHATSAPP,
         "plans": PLANS,
     }
@@ -843,9 +851,9 @@ class ActivateIn(BaseModel):
 def admin_activate(data: ActivateIn, user_id: int = Depends(get_current_user)):
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT email FROM users WHERE id=%s", (user_id,))
+        cur.execute("SELECT id, email FROM users WHERE id=%s", (user_id,))
         me = cur.fetchone()
-    if not ADMIN_EMAIL or me["email"] != ADMIN_EMAIL:
+    if not is_admin_user(me):
         raise HTTPException(403, "غير مصرح — هذه اللوحة للمشرف فقط")
     if data.plan not in PLANS:
         raise HTTPException(400, "خطة غير معروفة")
@@ -862,3 +870,29 @@ def admin_activate(data: ActivateIn, user_id: int = Depends(get_current_user)):
     if not row:
         raise HTTPException(404, "لا يوجد مستخدم مسجل بهذا البريد")
     return row
+
+
+@app.get("/api/admin/users")
+def admin_users(user_id: int = Depends(get_current_user)):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, email FROM users WHERE id=%s", (user_id,))
+        me = cur.fetchone()
+        if not is_admin_user(me):
+            raise HTTPException(403, "غير مصرح — هذه اللوحة للمشرف فقط")
+        cur.execute("""
+            SELECT u.id, u.email, u.company_name,
+                   COALESCE(u.plan,'free') AS plan, u.plan_expires_at, u.created_at,
+                   (SELECT COUNT(*) FROM searches s
+                      WHERE s.user_id = u.id
+                        AND s.created_at >= date_trunc('month', NOW())) AS searches_used,
+                   (SELECT COUNT(*) FROM leads l WHERE l.user_id = u.id) AS leads_count
+            FROM users u ORDER BY u.id DESC LIMIT 300
+        """)
+        rows = cur.fetchall()
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for r in rows:
+        exp = r.get("plan_expires_at")
+        r["active"] = bool(r["plan"] != "free" and exp and exp > now)
+    return rows
