@@ -896,3 +896,50 @@ def admin_users(user_id: int = Depends(get_current_user)):
         exp = r.get("plan_expires_at")
         r["active"] = bool(r["plan"] != "free" and exp and exp > now)
     return rows
+
+
+# ================== إدارة الحساب (البريد وكلمة المرور) ==================
+class ChangeEmailIn(BaseModel):
+    new_email: str
+    password: str
+
+
+class ChangePasswordIn(BaseModel):
+    current_password: str
+    new_password: str
+
+
+def _verify_own_password(user_id: int, password: str):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT password_hash FROM users WHERE id=%s", (user_id,))
+        row = cur.fetchone()
+    if not row or not verify_password(password, row["password_hash"]):
+        raise HTTPException(401, "كلمة المرور الحالية غير صحيحة")
+
+
+@app.post("/api/account/email")
+def change_email(data: ChangeEmailIn, user_id: int = Depends(get_current_user)):
+    new_email = data.new_email.strip().lower()
+    if "@" not in new_email or len(new_email) < 5:
+        raise HTTPException(400, "بريد إلكتروني غير صالح")
+    _verify_own_password(user_id, data.password)
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM users WHERE email=%s AND id<>%s", (new_email, user_id))
+        if cur.fetchone():
+            raise HTTPException(400, "هذا البريد مستخدم في حساب آخر")
+        cur.execute("UPDATE users SET email=%s WHERE id=%s", (new_email, user_id))
+    return {"ok": True, "email": new_email}
+
+
+@app.post("/api/account/password")
+def change_password(data: ChangePasswordIn, user_id: int = Depends(get_current_user)):
+    if len(data.new_password) < 6:
+        raise HTTPException(400, "كلمة المرور الجديدة يجب أن تكون 6 أحرف على الأقل")
+    _verify_own_password(user_id, data.current_password)
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET password_hash=%s WHERE id=%s",
+                    (hash_password(data.new_password), user_id))
+    return {"ok": True}
