@@ -167,6 +167,9 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
 .btn-fu:hover{background:#FDE68A}
 #followBox{margin-bottom:16px}
 .usage-bar{margin-top:14px;font-size:13.5px;color:var(--muted)}
+.setup-hint{margin-top:12px;background:#FFF7ED;border:1.5px solid #FED7AA;color:#9A3412;border-radius:12px;padding:11px 16px;font-size:14px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+.setup-hint:hover{background:#FFEDD5}
+.welcome-note{background:#F0F7F4;border:1.5px solid #BBE3D3;border-radius:10px;padding:11px 14px;font-size:13.5px;color:var(--primary-dark);margin-bottom:16px;line-height:1.7}
 .link-btn{background:none;border:none;color:var(--primary);font-weight:700;cursor:pointer;font-size:13px;text-decoration:underline;font-family:inherit;padding:0 4px}
 .plans-modal{max-width:720px}
 #plansGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:6px}
@@ -291,6 +294,7 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
     </div>
     <div class="chips" id="chips"></div>
     <div class="usage-bar" id="usageBar"></div>
+    <div id="setupHintBox"></div>
   </div>
 
   <div class="container">
@@ -317,6 +321,7 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
 <div class="overlay hidden" id="settingsOverlay">
   <div class="modal">
     <h3 id="setTitle"></h3>
+    <div class="welcome-note hidden" id="welcomeNote"></div>
     <div class="field">
       <label id="setLblName"></label>
       <input id="setCompany" type="text">
@@ -398,6 +403,8 @@ const T = {
     reviews:"تقييم", loading:"جارٍ التحميل…",
     errNetwork:"تعذر الاتصال بالخادم", done:(n)=>`تم العثور على ${n} عميل محتمل`,
     settings:"إعدادات الشركة", setTitle:"إعدادات الشركة",
+    setupHint:"💡 أضف وصف نشاطك من الإعدادات ليعمل «التحليل الذكي» ويناسب شركتك",
+    welcomeNote:"👋 أهلاً بك! قبل ما تبدأ، عرّفنا بنشاطك في الخانة أدناه — كل ما كان الوصف أدق، كان التحليل الذكي أذكى في ترتيب العملاء وكتابة الرسائل المناسبة لك.",
     setName:"اسم الشركة (يظهر في ملف PDF)", setLogo:"شعار الشركة (يظهر في ملف PDF)",
     save:"حفظ", cancel:"إلغاء", saved:"تم الحفظ",
     pdf:"⬇ تحميل PDF", pdfWorking:"جارٍ التوليد…", pdfHint:"أضف اسم شركتك وشعارك من «إعدادات الشركة» ليظهرا في الملف",
@@ -489,6 +496,8 @@ const T = {
     reviews:"reviews", loading:"Loading…",
     errNetwork:"Could not reach the server", done:(n)=>`Found ${n} leads`,
     settings:"Company settings", setTitle:"Company settings",
+    setupHint:"💡 Add your business description in Settings so AI Analysis can tailor results to you",
+    welcomeNote:"👋 Welcome! Before you start, tell us about your business in the field below — the more specific it is, the smarter the AI gets at ranking leads and writing messages for you.",
     setName:"Company name (shown in PDF)", setLogo:"Company logo (shown in PDF)",
     save:"Save", cancel:"Cancel", saved:"Saved",
     pdf:"⬇ Download PDF", pdfWorking:"Generating…", pdfHint:"Add your company name and logo in Company settings to show them in the file",
@@ -609,6 +618,7 @@ function applyLang(){
     `<button class="chip" onclick="useChip(this)">${c}</button>`).join("");
   applyAuthMode();
   applyLanding();
+  if(typeof refreshSetupHint === "function") refreshSetupHint();
   $("acctTitle").textContent = t().acctTitle;
   $("acctNowLbl").textContent = t().acctNow;
   $("acctLblEmail").textContent = t().acctEmail;
@@ -694,7 +704,7 @@ function showApp(){
   $("appScreen").classList.remove("hidden");
   $("logoutBtn").classList.remove("hidden");
   $("settingsBtn").classList.remove("hidden");
-  loadCompany();
+  loadCompany(true);
   loadUsage();
   loadHistory();
 }
@@ -952,11 +962,29 @@ function copyMsg(btn){
 }
 let companyData = {company_name:"", logo_base64:""};
 
-async function loadCompany(){
-  try{ companyData = await api("/api/company"); }catch(e){}
+async function loadCompany(firstOpen){
+  try{
+    companyData = await api("/api/company");
+    refreshSetupHint();
+    // أول دخول بلا وصف نشاط: افتح الإعدادات تلقائياً لإرشاد المستخدم
+    if(firstOpen && !(companyData.business_description||"").trim()){
+      setTimeout(openSettings, 500);
+    }
+  }catch(e){}
 }
+function refreshSetupHint(){
+  const box = $("setupHintBox");
+  if(!box) return;
+  const hasDesc = companyData && (companyData.business_description||"").trim().length > 0;
+  box.innerHTML = hasDesc ? "" : `<div class="setup-hint" onclick="openSettings()">${t().setupHint}</div>`;
+}
+
 function openSettings(){
   $("acctNow").textContent = (usageData && usageData.email) || "";
+  const hasDesc = companyData && (companyData.business_description||"").trim().length > 0;
+  const wn = $("welcomeNote");
+  if(!hasDesc){ wn.textContent = t().welcomeNote; wn.classList.remove("hidden"); }
+  else wn.classList.add("hidden");
   $("setCompany").value = companyData.company_name || "";
   $("setDesc").value = companyData.business_description || "";
   const p = $("logoPreview");
@@ -983,6 +1011,7 @@ async function saveSettings(){
     companyData.business_description = $("setDesc").value;
     await api("/api/company", {method:"POST", body:JSON.stringify(companyData)});
     toast(t().saved);
+    refreshSetupHint();
     closeSettings();
   }catch(e){ toast(e.message, true); }
 }
